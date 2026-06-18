@@ -1,114 +1,194 @@
 import {
-	Editor,
-	MarkdownView,
-	MarkdownFileInfo,
-	Modal,
-	Notice,
-	Plugin,
-} from 'obsidian';
-import {
-	DEFAULT_SETTINGS,
-	MyPluginSettings,
-	SampleSettingTab,
-} from './settings';
+  App, Plugin, PluginSettingTab, Setting,
+  TFile,
+  Menu, TAbstractFile,
+  WorkspaceLeaf,
+} from "obsidian";
+import { AnnotationStore } from "./storage";
+import { PDFArtSettings, DEFAULT_SETTINGS } from "./types";
+import { NativePDFArtOverlayManager } from "./native-overlay";
+import { registerPDFArtCommands } from "./commands";
+import { PDFArtToolView, VIEW_TYPE_PDF_ART_TOOLS } from "./tool-view";
 
-// Remember to rename these classes and interfaces!
+export default class PDFArtAnnotatorPlugin extends Plugin {
+  pluginSettings!: PDFArtSettings;
+  store!: AnnotationStore;
+  nativeOverlay!: NativePDFArtOverlayManager;
 
-export default class MyPlugin extends Plugin {
-	settings!: MyPluginSettings;
+  async onload() {
+    console.log("Loading PDF Art Annotator plugin");
 
-	async onload() {
-		await this.loadSettings();
+    await this.loadPluginSettings();
+    this.store = new AnnotationStore(this.app.vault);
+    this.nativeOverlay = new NativePDFArtOverlayManager(this, this.store, () => this.pluginSettings);
+    this.registerView(VIEW_TYPE_PDF_ART_TOOLS, (leaf) => new PDFArtToolView(leaf, this));
 
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (_evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
+    this.addRibbonIcon("pen-tool", "PDF Art Annotator", () => {
+      void this.activateToolView();
+    });
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
+    // Context menu on PDF files
+    this.registerEvent(
+      this.app.workspace.on("file-menu", (menu: Menu, file: TAbstractFile) => {
+        if (file instanceof TFile && file.extension.toLowerCase() === "pdf") {
+          menu.addItem((item) => {
+            item
+              .setTitle("用 PDF Art Annotator 打开")
+              .setIcon("pen-tool")
+              .onClick(() => {
+                this.openPDFInViewer(file);
+              });
+          });
+        }
+      })
+    );
 
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			},
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (
-				editor: Editor,
-				_ctx: MarkdownView | MarkdownFileInfo,
-			) => {
-				editor.replaceSelection('Sample editor command');
-			},
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView =
-					this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
+    // Auto-open PDFs in the annotator (configurable in settings)
+    this.registerEvent(
+      this.app.workspace.on("file-open", (file) => {
+        if (
+          file &&
+          file.extension.toLowerCase() === "pdf" &&
+          this.pluginSettings.autoOpenPDF
+        ) {
+          // Small delay so the default PDF view has time to open first,
+          // then we attach the overlay to the native PDF page.
+          setTimeout(() => {
+            this.nativeOverlay.scheduleSync();
+            void this.refreshToolViews();
+          }, 120);
+        }
+      })
+    );
+    this.registerEvent(this.app.workspace.on("active-leaf-change", () => {
+      this.nativeOverlay.scheduleSync();
+      void this.refreshToolViews();
+    }));
+    this.registerEvent(this.app.workspace.on("layout-change", () => {
+      this.nativeOverlay.scheduleSync();
+      void this.refreshToolViews();
+    }));
+    registerPDFArtCommands(this);
 
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-				return false;
-			},
-		});
+    // Settings tab
+    this.addSettingTab(new PDFArtSettingTab(this.app, this));
+    this.nativeOverlay.scheduleSync();
+  }
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
+  async onunload() {
+    console.log("Unloading PDF Art Annotator plugin");
+    this.nativeOverlay?.destroy();
+  }
 
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(activeDocument, 'click', (_evt: MouseEvent) => {
-			new Notice('Click');
-		});
+  async loadPluginSettings() {
+    this.pluginSettings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+  }
 
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(
-			window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000),
-		);
-	}
+  async savePluginSettings() {
+    await this.saveData(this.pluginSettings);
+  }
 
-	onunload() {}
+  async openPDFInViewer(file: TFile) {
+    await this.app.workspace.openLinkText(file.path, "", false);
+    this.nativeOverlay.scheduleSync();
+    await this.activateToolView(false);
+  }
 
-	async loadSettings() {
-		this.settings = Object.assign(
-			{},
-			DEFAULT_SETTINGS,
-			(await this.loadData()) as Partial<MyPluginSettings>,
-		);
-	}
+  hasActivePDF() {
+    const activeFile = this.app.workspace.getActiveFile();
+    return activeFile?.extension.toLowerCase() === "pdf";
+  }
 
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
+  async activateToolView(reveal = true) {
+    let leaf: WorkspaceLeaf | null = this.app.workspace.getLeavesOfType(VIEW_TYPE_PDF_ART_TOOLS)[0] ?? null;
+    if (!leaf) {
+      leaf = this.app.workspace.getRightLeaf(false);
+      if (!leaf) return;
+      await leaf.setViewState({ type: VIEW_TYPE_PDF_ART_TOOLS, active: true });
+    }
+    if (reveal) this.app.workspace.revealLeaf(leaf);
+    await this.refreshToolViews();
+  }
+
+  async refreshToolViews() {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_PDF_ART_TOOLS)) {
+      if (leaf.view instanceof PDFArtToolView) {
+        await leaf.view.render();
+      }
+    }
+  }
 }
 
-class SampleModal extends Modal {
-	onOpen() {
-		const { contentEl } = this;
-		contentEl.setText('Woah!');
-	}
+class PDFArtSettingTab extends PluginSettingTab {
+  plugin: PDFArtAnnotatorPlugin;
 
-	onClose() {
-		const { contentEl } = this;
-		contentEl.empty();
-	}
+  constructor(app: App, plugin: PDFArtAnnotatorPlugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+    containerEl.createEl("h2", { text: "PDF Art Annotator 设置" });
+
+    new Setting(containerEl)
+      .setName("默认画笔颜色")
+      .setDesc("新建批注的默认颜色")
+      .addColorPicker((cb) =>
+        cb.setValue(this.plugin.pluginSettings.defaultPenColor).onChange(async (v) => {
+          this.plugin.pluginSettings.defaultPenColor = v;
+          await this.plugin.savePluginSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("默认画笔粗细")
+      .addSlider((s) =>
+        s.setLimits(1, 20, 1).setValue(this.plugin.pluginSettings.defaultPenWidth).setDynamicTooltip().onChange(async (v) => {
+          this.plugin.pluginSettings.defaultPenWidth = v;
+          await this.plugin.savePluginSettings();
+        })
+      );
+
+    new Setting(containerEl).setName("默认荧光笔颜色").addColorPicker((cb) =>
+      cb.setValue(this.plugin.pluginSettings.defaultHighlighterColor).onChange(async (v) => {
+        this.plugin.pluginSettings.defaultHighlighterColor = v;
+        await this.plugin.savePluginSettings();
+      })
+    );
+
+    new Setting(containerEl)
+      .setName("默认荧光笔粗细")
+      .addSlider((s) =>
+        s.setLimits(5, 30, 1).setValue(this.plugin.pluginSettings.defaultHighlighterWidth).setDynamicTooltip().onChange(async (v) => {
+          this.plugin.pluginSettings.defaultHighlighterWidth = v;
+          await this.plugin.savePluginSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("默认字体大小")
+      .addSlider((s) =>
+        s.setLimits(10, 48, 2).setValue(this.plugin.pluginSettings.defaultFontSize).setDynamicTooltip().onChange(async (v) => {
+          this.plugin.pluginSettings.defaultFontSize = v;
+          await this.plugin.savePluginSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("自动连接 PDF Art 标注层")
+      .setDesc("打开 PDF 时，自动在 Obsidian 原生 PDF 页面上准备 PDF Art 标注层")
+      .addToggle((t) =>
+        t.setValue(this.plugin.pluginSettings.autoOpenPDF).onChange(async (v) => {
+          this.plugin.pluginSettings.autoOpenPDF = v;
+          await this.plugin.savePluginSettings();
+        })
+      );
+
+    containerEl.createEl("p", {
+      text: "批注数据以普通 JSON 文件形式统一保存在 vault 根目录的 PDF Art Annotations 文件夹中，文件名由原 PDF 文件名和源路径短哈希组成，便于同步、备份和辨认。",
+      cls: "setting-item-description",
+    });
+  }
 }

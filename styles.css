@@ -1,8 +1,228 @@
-/*
+/* Native Obsidian PDF viewer integration */
+.pdf-art-native-host {
+  position: relative;
+}
 
-This CSS file will be included with your plugin, and
-available in the app when your plugin is enabled.
+.pdf-art-native-btn {
+  min-width: 34px;
+  height: 30px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 0 8px;
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+}
 
-If your plugin does not need CSS, delete this file.
+.pdf-art-native-btn:hover {
+  background: var(--background-modifier-hover);
+}
 
-*/
+.pdf-art-native-btn.is-active {
+  border-color: var(--interactive-accent);
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.pdf-art-native-toggle {
+  font-weight: 600;
+}
+
+.pdf-art-native-color {
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 1px;
+  background: var(--background-secondary);
+}
+
+.pdf-art-native-width {
+  width: 76px;
+  accent-color: var(--interactive-accent);
+}
+
+.pdf-art-native-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  touch-action: pan-x pan-y pinch-zoom;
+}
+
+.pdf-art-native-overlay:not(.is-enabled) {
+  visibility: hidden;
+}
+
+.pdf-art-native-overlay.is-enabled {
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.pdf-art-native-overlay.is-mask-hidden {
+  pointer-events: none;
+}
+
+.pdf-art-native-overlay.is-enabled[data-tool="pen"] { cursor: crosshair; }
+.pdf-art-native-overlay.is-enabled[data-tool="highlighter"] { cursor: cell; }
+.pdf-art-native-overlay.is-enabled[data-tool="eraser"] { cursor: not-allowed; }
+.pdf-art-native-overlay.is-enabled[data-tool="text"] { cursor: text; }
+.pdf-art-native-overlay.is-enabled[data-tool="guide"] { cursor: move; }
+
+.pdf-art-native-overlay.is-writing {
+  touch-action: none;
+}
+
+.pdf-art-native-text-editor {
+  position: fixed;
+  z-index: 10000;
+  width: min(260px, calc(100vw - 16px));
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 8px;
+  background: var(--background-primary);
+  box-shadow: var(--shadow-s);
+  pointer-events: auto;
+}
+
+.pdf-art-native-textarea {
+  width: 100%;
+  min-height: 76px;
+  resize: vertical;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 6px;
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  font: inherit;
+}
+
+.pdf-art-native-text-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.is-mobile .pdf-art-native-btn,
+.is-mobile .pdf-art-native-color {
+  min-width: 38px;
+  height: 38px;
+}
+
+.is-mobile .pdf-art-native-width {
+  width: 92px;
+}
+
+/* Obsidian-native tool view */
+.pdf-art-tool-view {
+  padding: 12px;
+  color: var(--text-normal);
+}
+
+.pdf-art-tool-view-header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.pdf-art-tool-view-title {
+  font-weight: 700;
+  font-size: var(--font-ui-medium);
+}
+
+.pdf-art-tool-view-status {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.pdf-art-tool-section {
+  margin: 14px 0 8px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+}
+
+.pdf-art-tool-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.pdf-art-tool-button {
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  cursor: pointer;
+}
+
+.pdf-art-tool-button:hover {
+  background: var(--background-modifier-hover);
+}
+
+.pdf-art-tool-button.is-active,
+.pdf-art-tool-view-toggle.is-active {
+  border-color: var(--interactive-accent);
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.pdf-art-tool-button:disabled,
+.pdf-art-tool-color:disabled,
+.pdf-art-tool-range:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.pdf-art-tool-button-icon {
+  display: inline-flex;
+  --icon-size: var(--icon-size-s);
+}
+
+.pdf-art-tool-view-toggle {
+  width: 100%;
+}
+
+.pdf-art-tool-field {
+  display: grid;
+  grid-template-columns: 54px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: var(--font-ui-small);
+}
+
+.pdf-art-tool-color {
+  width: 34px;
+  height: 30px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 1px;
+  background: var(--background-secondary);
+}
+
+.pdf-art-tool-range {
+  width: 100%;
+  accent-color: var(--interactive-accent);
+}
+
+.pdf-art-tool-range-value {
+  min-width: 2.5em;
+  color: var(--text-muted);
+  text-align: right;
+  font-size: var(--font-ui-smaller);
+}

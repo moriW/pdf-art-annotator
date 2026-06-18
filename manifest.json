@@ -1,11 +1,9 @@
 {
-	"id": "sample-plugin",
-	"name": "Sample Plugin",
-	"version": "1.0.0",
-	"minAppVersion": "1.0.0",
-	"description": "Demonstrates some of the capabilities of the Obsidian API.",
-	"author": "Obsidian",
-	"authorUrl": "https://obsidian.md",
-	"fundingUrl": "https://obsidian.md/pricing",
-	"isDesktopOnly": false
+  "id": "pdf-art-annotator",
+  "name": "PDF Art Annotator",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "批注 PDF 画册：自由绘图、构图辅助线（九宫格/黄金螺旋/黄金分割）、段落文本",
+  "author": "",
+  "isDesktopOnly": false
 }
