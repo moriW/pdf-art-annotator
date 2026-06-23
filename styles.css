@@ -90,7 +90,7 @@
 }
 
 .pdf-art-native-text-layer.is-enabled.is-text-tool .pdf-art-native-text-box,
-.pdf-art-native-text-editor {
+.pdf-art-native-text-layer.is-enabled.is-text-tool .pdf-art-native-text-editor {
   pointer-events: auto;
 }
 
@@ -108,7 +108,7 @@
   user-select: none;
 }
 
-.pdf-art-native-text-layer.is-text-tool .pdf-art-native-text-box {
+.pdf-art-native-text-layer.is-enabled.is-text-tool .pdf-art-native-text-box {
   border-color: var(--background-modifier-border);
   background: color-mix(in srgb, var(--background-primary) 72%, transparent);
   cursor: move;

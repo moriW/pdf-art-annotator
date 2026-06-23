@@ -117,7 +117,10 @@ export class NativePageOverlay {
     this.canvas.dataset.tool = this.manager.getTool();
     this.cursor.dataset.tool = this.manager.getTool();
     this.updateCursorStyle();
-    if (!this.manager.getEnabled()) this.hideCursor();
+    if (!this.manager.getEnabled()) {
+      this.finishTextEditor?.();
+      this.hideCursor();
+    }
   }
 
   render() {
@@ -336,7 +339,7 @@ export class NativePageOverlay {
       box.setText(text.text);
       box.toggleClass("is-selected", this.manager.isSelected(this.pageNumber, "text", text.id));
       box.addEventListener("pointerdown", (event) => this.onTextPointerDown(event, text));
-      if (this.manager.getTool() === "text") {
+      if (this.manager.getEnabled() && this.manager.getTool() === "text") {
         const remove = box.createEl("button", { cls: "pdf-art-native-text-remove", text: "×" });
         remove.type = "button";
         remove.addEventListener("pointerdown", (event) => {

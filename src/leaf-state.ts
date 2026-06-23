@@ -140,6 +140,7 @@ export class NativePDFArtLeafState {
 	toggleEnabled() {
 		this.enabled = !this.enabled;
 		this.refreshOverlayState();
+		this.renderAll();
 	}
 
 	getEnabled() { return this.enabled; }
@@ -156,7 +157,6 @@ export class NativePDFArtLeafState {
 
 	setTool(tool: Tool) {
 		this.tool = tool;
-		this.enabled = true;
 		const settings = this.getSettings();
 		if (tool !== "select") this.selectedItems = [];
 		if (tool === "select") {
