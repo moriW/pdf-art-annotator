@@ -1,12 +1,26 @@
 import { Notice, TFile, WorkspaceLeaf } from "obsidian";
 import { AnnotationStore } from "./storage";
-import { PDFAnnotationData, PageAnnotations, PenStroke, TextAnnotation } from "./types";
-import { GuideState, GuideType } from "./guides";
+import { PDFAnnotationData, PageAnnotations, StrokeAnnotation, TextAnnotation } from "./types";
 import { NativePageOverlay } from "./page-overlay";
+import { GuideAnnotation, GuideType } from "./guides";
 
-export type Tool = "pen" | "highlighter" | "eraser" | "text" | "guide";
-export type GuideHitMode = "move" | "resize-tl" | "resize-br" | "delete" | "rotate" | "mirror-x" | "mirror-y";
-export type TextHitMode = "move" | "delete";
+export type Tool = "select" | "pen" | "highlighter" | "eraser" | "text" | "guide";
+export type SelectableAnnotationType = "stroke" | "text" | "guide";
+export interface SelectedAnnotation {
+	page: number;
+	type: SelectableAnnotationType;
+	id: string;
+}
+export type GuideHitMode =
+	| "move"
+	| "delete"
+	| "rotate"
+	| "resize-nw"
+	| "resize-ne"
+	| "resize-se"
+	| "resize-sw"
+	| "mirror-x"
+	| "mirror-y";
 
 export const SELECTORS = {
 	viewerContainer: ".pdf-viewer-container",
@@ -14,14 +28,12 @@ export const SELECTORS = {
 	canvasWrapper: ".canvasWrapper",
 } as const;
 
-// ── Tuning constants ──
-export const SYNC_DEBOUNCE_MS = 120;
-export const MUTATION_DEBOUNCE_MS = 60;
+export const MAX_STROKE_WIDTH = 30;
+export const MIN_STROKE_WIDTH = 1;
 export const MAX_FONT_SIZE = 72;
 export const MIN_FONT_SIZE = 8;
-export const MAX_STROKE_WIDTH = 30;
-export const DEFAULT_TEXT_WIDTH_RATIO = 0.28;
-export const DEFAULT_GUIDE_SIZE = 0.8;
+export const DEFAULT_TEXT_WIDTH = 0.28;
+export const DEFAULT_GUIDE_SIZE = 0.72;
 
 export interface NativeOverlaySettings {
 	defaultPenColor: string;
@@ -30,43 +42,48 @@ export interface NativeOverlaySettings {
 	defaultHighlighterWidth: number;
 	defaultTextColor: string;
 	defaultFontSize: number;
+	eraserWidth: number;
 }
 
-// ── Helpers ──
+interface ActiveTextEditor {
+	page: number;
+	id: string | null;
+	applyStyle: (style: { color: string; fontSize: number }) => void;
+}
 
-export function strokeNearPoint(stroke: PenStroke, x: number, y: number, radius: number, pageWidth: number, pageHeight: number) {
+export function strokeNearPoint(stroke: StrokeAnnotation, x: number, y: number, radiusPx: number, pageWidth: number, pageHeight: number) {
 	for (const point of stroke.points) {
-		const px = point.x <= 1 ? point.x : point.x / pageWidth;
-		const py = point.y <= 1 ? point.y : point.y / pageHeight;
-		if (Math.hypot(px - x, py - y) <= radius) return true;
+		const dx = point.x * pageWidth - x * pageWidth;
+		const dy = point.y * pageHeight - y * pageHeight;
+		if (Math.hypot(dx, dy) <= radiusPx) return true;
 	}
 	return false;
 }
-
-// ── Leaf state ──
 
 export class NativePDFArtLeafState {
 	private root: HTMLElement | null = null;
 	private file: TFile | null = null;
 	private data: PDFAnnotationData | null = null;
 	private mutationObserver: MutationObserver | null = null;
-	private mutationTimer: number | null = null;
 	private intersectionObserver: IntersectionObserver | null = null;
+	private syncingPages = false;
+	private syncing = false;
 	private observedPages = new Map<HTMLElement, number>();
 	private visiblePages = new Set<number>();
 	private overlays = new Map<number, NativePageOverlay>();
 	private enabled = false;
 	private tool: Tool = "pen";
 	private guideType: GuideType = "grid-9";
+	private selectedItems: SelectedAnnotation[] = [];
 	private color = "#ff0000";
 	private width = 3;
-	private selectedGuide: { page: number; id: string } | null = null;
-	private selectedText: { page: number; index: number } | null = null;
+	private activeTextEditor: ActiveTextEditor | null = null;
 
 	constructor(
 		private readonly leaf: WorkspaceLeaf,
 		private readonly store: AnnotationStore,
-		private readonly getSettings: () => NativeOverlaySettings
+		private readonly getSettings: () => NativeOverlaySettings,
+		private readonly onStateChange: () => void = () => {}
 	) {
 		const settings = this.getSettings();
 		this.color = settings.defaultPenColor;
@@ -74,41 +91,41 @@ export class NativePDFArtLeafState {
 	}
 
 	async sync() {
-		const view = this.leaf.view as any;
-		const file = view.file instanceof TFile ? view.file : null;
-		const root = view.containerEl as HTMLElement | undefined;
-		if (!file || file.extension.toLowerCase() !== "pdf" || !root) {
-			this.destroy();
-			return;
-		}
-		this.root = root;
-		this.root.addClass("pdf-art-native-host");
-		if (this.file?.path !== file.path) {
-			this.file = file;
-			try {
-				this.data = (await this.store.load(file.path)) ?? { source: file.path, pages: [], version: 1 };
-			} catch (error) {
-				console.error("PDF Art Annotator: failed to load annotations", error);
-				new Notice("PDF Art Annotator：批注 JSON 损坏或无法读取，已停止加载以避免覆盖数据。");
-				this.data = null;
-				this.file = null;
-				for (const overlay of this.overlays.values()) overlay.destroy();
-				this.overlays.clear();
+		if (this.syncing) return;
+		this.syncing = true;
+		try {
+			const view = this.leaf.view as any;
+			const file = view.file instanceof TFile ? view.file : null;
+			const root = view.containerEl as HTMLElement | undefined;
+			if (!file || file.extension.toLowerCase() !== "pdf" || !root) {
+				this.destroy();
 				return;
 			}
-			this.selectedGuide = null;
-			this.selectedText = null;
+			this.root = root;
+			this.root.addClass("pdf-art-native-host");
+			if (this.file?.path !== file.path) {
+				this.file = file;
+				try {
+						this.data = (await this.store.load(file.path)) ?? { source: file.path, pages: [], version: 5 };
+				} catch (error) {
+					console.error("PDF Art Annotator: failed to load annotations", error);
+					new Notice("PDF Art Annotator：批注 JSON 损坏或无法读取，已停止加载以避免覆盖数据。");
+					this.data = null;
+					this.file = null;
+					for (const overlay of this.overlays.values()) overlay.destroy();
+					this.overlays.clear();
+					return;
+				}
+			}
+			this.ensureMutationObserver();
+			this.syncPages();
+			this.renderAll();
+		} finally {
+			this.syncing = false;
 		}
-		this.ensureMutationObserver();
-		this.syncPages();
-		this.renderAll();
 	}
 
 	destroy() {
-		if (this.mutationTimer !== null) {
-			window.clearTimeout(this.mutationTimer);
-			this.mutationTimer = null;
-		}
 		this.mutationObserver?.disconnect();
 		this.mutationObserver = null;
 		this.intersectionObserver?.disconnect();
@@ -130,14 +147,21 @@ export class NativePDFArtLeafState {
 	getColor() { return this.color; }
 	getWidth() { return this.width; }
 	getGuideType() { return this.guideType; }
-	getSelectedGuide() { return this.selectedGuide; }
-	getSelectedText() { return this.selectedText; }
+	getSelection() { return this.selectedItems; }
+	getSelectedGuide() {
+		const item = this.selectedItems.length === 1 && this.selectedItems[0].type === "guide" ? this.selectedItems[0] : null;
+		return item ? { page: item.page, id: item.id } : null;
+	}
+	hasActiveTextEditor() { return this.activeTextEditor !== null; }
 
 	setTool(tool: Tool) {
 		this.tool = tool;
 		this.enabled = true;
 		const settings = this.getSettings();
-		if (tool === "pen") {
+		if (tool !== "select") this.selectedItems = [];
+		if (tool === "select") {
+			// Keep current visual values; selection style sync happens when an item is selected.
+		} else if (tool === "pen") {
 			this.color = settings.defaultPenColor;
 			this.width = settings.defaultPenWidth;
 		} else if (tool === "highlighter") {
@@ -146,51 +170,64 @@ export class NativePDFArtLeafState {
 		} else if (tool === "text") {
 			this.color = settings.defaultTextColor;
 			this.width = settings.defaultFontSize;
+		} else if (tool === "guide") {
+			this.color = "#ffffff";
+			this.width = 1;
+		} else {
+			this.width = settings.eraserWidth;
 		}
-		if (tool !== "guide") this.selectedGuide = null;
-		if (tool !== "text") this.selectedText = null;
+		this.refreshOverlayState();
 		this.renderAll();
 	}
 
 	setColor(color: string) {
 		this.color = color;
-		if (this.selectedText) {
-			void this.updateText(this.selectedText.page, this.selectedText.index, { color });
-		}
-		this.applySelectedGuideStyle({ color });
+		this.applyActiveTextStyle();
+		this.applySelectedStyle();
+		this.refreshOverlayState();
 	}
 
 	setWidth(width: number) {
-		this.width = width;
-		if (this.selectedText || this.tool === "text") {
-			const nextSize = Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, width));
-			this.width = nextSize;
-			if (this.selectedText) {
-				const pageWidth = this.overlays.get(this.selectedText.page)?.getPageWidth();
-				void this.updateText(this.selectedText.page, this.selectedText.index, {
-					fontSize: nextSize,
-					fontSizeRatio: pageWidth && pageWidth > 0 ? nextSize / pageWidth : undefined,
-				});
-			}
-			return;
+		const selected = this.selectedItems.length > 0 ? this.selectedItems : null;
+		const selectionIsTextOnly = selected?.every((item) => item.type === "text") ?? false;
+		if (this.tool === "text" || selectionIsTextOnly) {
+			this.width = Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, width));
+		} else {
+			this.width = Math.min(MAX_STROKE_WIDTH, Math.max(MIN_STROKE_WIDTH, width));
 		}
-		this.applySelectedGuideStyle({ strokeWidth: width });
+		this.applyActiveTextStyle();
+		this.applySelectedStyle();
+		this.refreshOverlayState();
 	}
 
 	setGuideType(type: GuideType) {
 		this.guideType = type;
 		this.setTool("guide");
-		this.selectedGuide = null;
-		this.renderAll();
+	}
+
+	beginTextEdit(page: number, id: string | null, initialStyle: { color: string; fontSize: number }, applyStyle: ActiveTextEditor["applyStyle"]) {
+		this.color = initialStyle.color;
+		this.width = Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, initialStyle.fontSize));
+		this.activeTextEditor = { page, id, applyStyle };
+		applyStyle({ color: this.color, fontSize: this.width });
+		this.refreshOverlayState();
+	}
+
+	endTextEdit(page: number, id: string | null) {
+		if (this.activeTextEditor?.page === page && this.activeTextEditor.id === id) {
+			this.activeTextEditor = null;
+		}
 	}
 
 	getPage(pageNumber: number): PageAnnotations {
 		if (!this.data) throw new Error("PDF Art native overlay has no data");
 		let page = this.data.pages.find((p) => p.page === pageNumber);
 		if (!page) {
-			page = { page: pageNumber, items: [], guides: [] };
+			page = { page: pageNumber, strokes: [], texts: [], guides: [] };
 			this.data.pages.push(page);
 		}
+		page.texts ??= [];
+		page.guides ??= [];
 		return page;
 	}
 
@@ -199,112 +236,75 @@ export class NativePDFArtLeafState {
 		await this.store.save(this.data);
 	}
 
-	async addStroke(pageNumber: number, stroke: PenStroke) {
-		this.getPage(pageNumber).items.push(stroke);
+	async addStroke(pageNumber: number, stroke: StrokeAnnotation) {
+		this.getPage(pageNumber).strokes.push(stroke);
 		await this.save();
 	}
 
-	async addText(pageNumber: number, x: number, y: number, text: string, pageWidth?: number) {
+	async addText(pageNumber: number, x: number, y: number, text: string, width = DEFAULT_TEXT_WIDTH) {
 		const trimmed = text.trim();
 		if (!trimmed) return;
-		const fontSize = Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, this.width));
-		const item: TextAnnotation = {
-			type: "text",
+		const page = this.getPage(pageNumber);
+		page.texts.push({
+			id: `text-${Date.now()}-${Math.random().toString(16).slice(2)}`,
 			x,
 			y,
+			width: Math.min(0.9, Math.max(0.08, width)),
 			text: trimmed,
-			fontSize,
-			fontSizeRatio: pageWidth && pageWidth > 0 ? fontSize / pageWidth : undefined,
 			color: this.color,
-			width: DEFAULT_TEXT_WIDTH_RATIO,
-		};
-		const page = this.getPage(pageNumber);
-		page.items.push(item);
-		this.selectedText = { page: pageNumber, index: page.items.length - 1 };
-		await this.save();
-		this.renderAll();
-	}
-
-	async addGuide(pageNumber: number, x: number, y: number) {
-		const id = `guide-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-		const w = DEFAULT_GUIDE_SIZE;
-		const h = DEFAULT_GUIDE_SIZE;
-		const rect = {
-			x: Math.min(1 - w, Math.max(0, x - w / 2)),
-			y: Math.min(1 - h, Math.max(0, y - h / 2)),
-			w,
-			h,
-		};
-		this.getPage(pageNumber).guides.push({
-			_id: id,
-			type: this.guideType,
-			visible: true,
-			rect,
-			rotation: 1,
-			strokeWidth: this.width,
-			color: this.color,
-			mirrorX: false,
-			mirrorY: false,
+			fontSize: Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, this.width)),
 		});
-		this.selectedGuide = { page: pageNumber, id };
 		await this.save();
 		this.renderAll();
 	}
 
-	selectText(page: number, index: number | null) {
-		this.selectedText = index === null ? null : { page, index };
-		if (index !== null) this.selectedGuide = null;
-		const item = index === null ? null : this.getPage(page).items[index];
-		if (item?.type === "text") {
-			this.color = item.color;
-			this.width = item.fontSize;
+	async updateText(pageNumber: number, id: string, patch: Partial<TextAnnotation>, options: { save?: boolean } = {}) {
+		const text = this.getPage(pageNumber).texts.find((item) => item.id === id);
+		if (!text) return;
+		Object.assign(text, patch);
+		if (text.text.trim().length === 0) {
+			await this.removeText(pageNumber, id);
+			return;
 		}
-		this.renderAll();
-	}
-
-	async updateText(pageNumber: number, index: number, patch: Partial<TextAnnotation>) {
-		const item = this.getPage(pageNumber).items[index];
-		if (!item || item.type !== "text") return;
-		Object.assign(item, patch);
-		await this.save();
-		this.renderAll();
-	}
-
-	async removeText(pageNumber: number, index: number) {
-		const page = this.getPage(pageNumber);
-		const item = page.items[index];
-		if (!item || item.type !== "text") return;
-		page.items.splice(index, 1);
-		this.selectedText = null;
-		await this.save();
-		this.renderAll();
-	}
-
-	async eraseAt(pageNumber: number, x: number, y: number, radius: number, options: { save?: boolean; pageWidth?: number; pageHeight?: number } = {}) {
-		const page = this.getPage(pageNumber);
-		const pw = options.pageWidth ?? 1000;
-		const ph = options.pageHeight ?? 1000;
-		page.items = page.items.filter((item) => {
-			if (item.type === "text") return true;
-			return !strokeNearPoint(item, x, y, radius, pw, ph);
-		});
 		if (options.save !== false) await this.save();
 		this.renderAll();
 	}
 
-	selectGuide(page: number, id: string | null) {
-		this.selectedGuide = id ? { page, id } : null;
-		const guide = id ? this.getPage(page).guides.find((g) => g._id === id) : null;
-		if (id) this.selectedText = null;
-		if (guide) {
-			this.color = guide.color ?? this.color;
-			this.width = guide.strokeWidth ?? this.width;
+	async removeText(pageNumber: number, id: string) {
+		const page = this.getPage(pageNumber);
+		page.texts = page.texts.filter((item) => item.id !== id);
+		this.selectedItems = this.selectedItems.filter((item) => !(item.page === pageNumber && item.type === "text" && item.id === id));
+		if (this.activeTextEditor?.page === pageNumber && this.activeTextEditor.id === id) {
+			this.activeTextEditor = null;
 		}
+		await this.save();
+		this.renderAll();
+		this.notifyStateChange();
+	}
+
+	async addGuide(pageNumber: number, x: number, y: number) {
+		const size = DEFAULT_GUIDE_SIZE;
+		const guide: GuideAnnotation = {
+			id: `guide-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+			type: this.guideType,
+			x: Math.min(1 - size, Math.max(0, x - size / 2)),
+			y: Math.min(1 - size, Math.max(0, y - size / 2)),
+			width: size,
+			height: size,
+			rotation: 0,
+			mirrorX: false,
+			mirrorY: false,
+			color: this.color,
+			strokeWidth: Math.min(MAX_STROKE_WIDTH, Math.max(MIN_STROKE_WIDTH, this.width)),
+		};
+		this.getPage(pageNumber).guides.push(guide);
+		this.selectItems([{ page: pageNumber, type: "guide", id: guide.id }]);
+		await this.save();
 		this.renderAll();
 	}
 
-	async updateGuide(pageNumber: number, id: string, patch: Partial<GuideState>, options: { save?: boolean } = {}) {
-		const guide = this.getPage(pageNumber).guides.find((g) => g._id === id);
+	async updateGuide(pageNumber: number, id: string, patch: Partial<GuideAnnotation>, options: { save?: boolean } = {}) {
+		const guide = this.getPage(pageNumber).guides.find((item) => item.id === id);
 		if (!guide) return;
 		Object.assign(guide, patch);
 		if (options.save !== false) await this.save();
@@ -313,83 +313,159 @@ export class NativePDFArtLeafState {
 
 	async removeGuide(pageNumber: number, id: string) {
 		const page = this.getPage(pageNumber);
-		page.guides = page.guides.filter((g) => g._id !== id);
-		if (this.selectedGuide?.id === id) this.selectedGuide = null;
+		page.guides = page.guides.filter((item) => item.id !== id);
+		this.selectedItems = this.selectedItems.filter((item) => !(item.page === pageNumber && item.type === "guide" && item.id === id));
 		await this.save();
 		this.renderAll();
+		this.notifyStateChange();
 	}
 
-	async clearCurrentPage() {
-		const pageNumber = this.getCurrentPageNumber();
-		if (!window.confirm(`清除第 ${pageNumber} 页的全部 PDF Art 标注？`)) return;
-		this.overlays.get(pageNumber)?.closeTextEditor();
-		const page = this.getPage(pageNumber);
-		page.items = [];
-		page.guides = [];
-		this.selectedGuide = null;
-		this.selectedText = null;
+	selectGuide(pageNumber: number, id: string | null) {
+		this.selectItems(id ? [{ page: pageNumber, type: "guide", id }] : []);
+	}
+
+	selectItems(items: SelectedAnnotation[]) {
+		const seen = new Set<string>();
+		this.selectedItems = items.filter((item) => {
+			const key = `${item.page}:${item.type}:${item.id}`;
+			if (seen.has(key)) return false;
+			seen.add(key);
+			return Boolean(this.findSelectedTarget(item));
+		});
+		this.syncStyleFromSelection();
+		this.refreshOverlayState();
+		this.renderAll();
+		this.notifyStateChange();
+	}
+
+	clearSelection() {
+		if (this.selectedItems.length === 0) return;
+		this.selectedItems = [];
+		this.refreshOverlayState();
+		this.renderAll();
+		this.notifyStateChange();
+	}
+
+	isSelected(page: number, type: SelectableAnnotationType, id: string) {
+		return this.selectedItems.some((item) => item.page === page && item.type === type && item.id === id);
+	}
+
+	async deleteSelection() {
+		if (this.selectedItems.length === 0) return false;
+		let deleted = 0;
+		for (const pageNumber of new Set(this.selectedItems.map((item) => item.page))) {
+			const page = this.getPage(pageNumber);
+			const selectedOnPage = this.selectedItems.filter((item) => item.page === pageNumber);
+			const strokeIds = new Set(selectedOnPage.filter((item) => item.type === "stroke").map((item) => item.id));
+			const textIds = new Set(selectedOnPage.filter((item) => item.type === "text").map((item) => item.id));
+			const guideIds = new Set(selectedOnPage.filter((item) => item.type === "guide").map((item) => item.id));
+			const before = page.strokes.length + page.texts.length + page.guides.length;
+			page.strokes = page.strokes.filter((item) => !strokeIds.has(item.id));
+			page.texts = page.texts.filter((item) => !textIds.has(item.id));
+			page.guides = page.guides.filter((item) => !guideIds.has(item.id));
+			deleted += before - page.strokes.length - page.texts.length - page.guides.length;
+			if (this.activeTextEditor?.page === pageNumber && this.activeTextEditor.id && textIds.has(this.activeTextEditor.id)) {
+				this.activeTextEditor = null;
+			}
+		}
+		this.selectedItems = [];
+		this.refreshOverlayState();
+		if (deleted === 0) {
+			this.renderAll();
+			this.notifyStateChange();
+			return false;
+		}
 		await this.save();
-		new Notice(`已清除第 ${pageNumber} 页的全部 PDF Art 标注`);
+		new Notice(`已删除 ${deleted} 个选中对象`);
+		this.renderAll();
+		this.notifyStateChange();
+		return true;
+	}
+
+	eraseAt(pageNumber: number, x: number, y: number, wrapper: HTMLElement, options: { save?: boolean } = {}) {
+		const page = this.getPage(pageNumber);
+		const before = page.strokes.length;
+		const rect = wrapper.getBoundingClientRect();
+		page.strokes = page.strokes.filter((stroke) => !strokeNearPoint(stroke, x, y, this.width, rect.width, rect.height));
+		const changed = page.strokes.length !== before;
+		if (changed && options.save !== false) void this.save();
+		if (changed) this.renderAll();
+		return changed;
+	}
+
+	clearCurrentPage() {
+		const pageNumber = this.getCurrentPageNumber();
+		if (!window.confirm(`清除第 ${pageNumber} 页的 PDF Art 标注？`)) return;
+		const page = this.getPage(pageNumber);
+		page.strokes = [];
+		page.texts = [];
+		page.guides = [];
+		this.selectedItems = this.selectedItems.filter((item) => item.page !== pageNumber);
+		void this.save();
+		new Notice(`已清除第 ${pageNumber} 页的 PDF Art 标注`);
 		this.renderAll();
 	}
 
 	private ensureMutationObserver() {
 		if (this.mutationObserver || !this.root) return;
-		this.mutationObserver = new MutationObserver(() => {
-			if (this.mutationTimer !== null) window.clearTimeout(this.mutationTimer);
-			this.mutationTimer = window.setTimeout(() => {
-				this.mutationTimer = null;
-				this.syncPages();
-			}, MUTATION_DEBOUNCE_MS);
+		this.mutationObserver = new MutationObserver((mutations) => {
+			if (mutations.every(isPDFArtMutation)) return;
+			this.syncPages();
 		});
 		this.mutationObserver.observe(this.root, { childList: true, subtree: true });
 	}
 
 	private syncPages() {
-		const pageElements = Array.from(this.root?.querySelectorAll<HTMLElement>(SELECTORS.pages) ?? []);
-		const pageElementSet = new Set(pageElements);
-		const pages = new Map<number, { pageEl: HTMLElement; wrapper: HTMLElement }>();
-		this.ensureIntersectionObserver();
-		for (const pageEl of pageElements) {
-			const pageNumber = Number(pageEl.dataset.pageNumber);
-			const wrapper = pageEl.querySelector<HTMLElement>(SELECTORS.canvasWrapper);
-			if (!Number.isInteger(pageNumber) || !wrapper) continue;
-			pages.set(pageNumber, { pageEl, wrapper });
-			if (!this.observedPages.has(pageEl)) {
-				this.observedPages.set(pageEl, pageNumber);
-				this.intersectionObserver?.observe(pageEl);
+		if (this.syncingPages) return;
+		this.syncingPages = true;
+		try {
+			const pageElements = Array.from(this.root?.querySelectorAll<HTMLElement>(SELECTORS.pages) ?? []);
+			const pageElementSet = new Set(pageElements);
+			const pages = new Map<number, { pageEl: HTMLElement; wrapper: HTMLElement }>();
+			this.ensureIntersectionObserver();
+			for (const pageEl of pageElements) {
+				const pageNumber = Number(pageEl.dataset.pageNumber);
+				const wrapper = pageEl.querySelector<HTMLElement>(SELECTORS.canvasWrapper);
+				if (!Number.isInteger(pageNumber) || !wrapper) continue;
+				pages.set(pageNumber, { pageEl, wrapper });
+				if (!this.observedPages.has(pageEl)) {
+					this.observedPages.set(pageEl, pageNumber);
+					this.intersectionObserver?.observe(pageEl);
+				}
 			}
-		}
-		for (const [pageEl, pageNumber] of Array.from(this.observedPages.entries())) {
-			if (!pageElementSet.has(pageEl)) {
-				this.intersectionObserver?.unobserve(pageEl);
-				this.observedPages.delete(pageEl);
-				this.visiblePages.delete(pageNumber);
+			for (const [pageEl, pageNumber] of Array.from(this.observedPages.entries())) {
+				if (!pageElementSet.has(pageEl)) {
+					this.intersectionObserver?.unobserve(pageEl);
+					this.observedPages.delete(pageEl);
+					this.visiblePages.delete(pageNumber);
+				}
 			}
-		}
-		const basePages = this.visiblePages.size > 0 ? this.visiblePages : new Set([this.getCurrentPageNumber()]);
-		const wanted = new Set<number>();
-		for (const pageNumber of basePages) {
-			for (let page = Math.max(1, pageNumber - 1); page <= pageNumber + 1; page += 1) {
-				wanted.add(page);
+			const basePages = this.visiblePages.size > 0 ? this.visiblePages : new Set([this.getCurrentPageNumber()]);
+			const wanted = new Set<number>();
+			for (const pageNumber of basePages) {
+				for (let page = Math.max(1, pageNumber - 1); page <= pageNumber + 1; page += 1) {
+					wanted.add(page);
+				}
 			}
-		}
-		for (const [pageNumber, { wrapper }] of pages.entries()) {
-			if (!wanted.has(pageNumber)) continue;
-			const existing = this.overlays.get(pageNumber);
-			if (!existing || !existing.usesWrapper(wrapper)) {
-				existing?.destroy();
-				this.overlays.set(pageNumber, new NativePageOverlay(this, pageNumber, wrapper));
+			for (const [pageNumber, { wrapper }] of pages.entries()) {
+				if (!wanted.has(pageNumber)) continue;
+				const existing = this.overlays.get(pageNumber);
+				if (!existing || !existing.usesWrapper(wrapper)) {
+					existing?.destroy();
+					this.overlays.set(pageNumber, new NativePageOverlay(this, pageNumber, wrapper));
+				}
 			}
-		}
-		for (const [page, overlay] of this.overlays) {
-			if (!wanted.has(page) || !pages.has(page)) {
-				overlay.destroy();
-				this.overlays.delete(page);
+			for (const [page, overlay] of this.overlays) {
+				if (!wanted.has(page) || !pages.has(page)) {
+					overlay.destroy();
+					this.overlays.delete(page);
+				}
 			}
+			this.refreshOverlayState();
+			this.renderAll();
+		} finally {
+			this.syncingPages = false;
 		}
-		this.refreshOverlayState();
-		this.renderAll();
 	}
 
 	private ensureIntersectionObserver() {
@@ -417,9 +493,73 @@ export class NativePDFArtLeafState {
 		for (const overlay of this.overlays.values()) overlay.render();
 	}
 
-	private applySelectedGuideStyle(patch: Partial<GuideState>) {
-		if (!this.selectedGuide) return;
-		void this.updateGuide(this.selectedGuide.page, this.selectedGuide.id, patch);
+	private notifyStateChange() {
+		this.onStateChange();
+	}
+
+	private applyActiveTextStyle() {
+		if (this.tool !== "text" || !this.activeTextEditor) return;
+		const fontSize = Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, this.width));
+		this.activeTextEditor.applyStyle({ color: this.color, fontSize });
+		if (this.activeTextEditor.id) {
+			void this.updateText(this.activeTextEditor.page, this.activeTextEditor.id, {
+				color: this.color,
+				fontSize,
+			}, { save: false });
+		}
+	}
+
+	private applySelectedStyle() {
+		if (this.selectedItems.length === 0) return;
+		for (const item of this.selectedItems) {
+			const target = this.findSelectedTarget(item);
+			if (!target) continue;
+			if (item.type === "stroke") {
+				Object.assign(target as StrokeAnnotation, {
+					color: this.color,
+					width: Math.min(MAX_STROKE_WIDTH, Math.max(MIN_STROKE_WIDTH, this.width)),
+				});
+			} else if (item.type === "text") {
+				Object.assign(target as TextAnnotation, {
+					color: this.color,
+					fontSize: Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, this.width)),
+				});
+			} else {
+				Object.assign(target as GuideAnnotation, {
+					color: this.color,
+					strokeWidth: Math.min(MAX_STROKE_WIDTH, Math.max(MIN_STROKE_WIDTH, this.width)),
+				});
+			}
+		}
+		void this.save();
+		this.renderAll();
+	}
+
+	private syncStyleFromSelection() {
+		if (this.selectedItems.length !== 1) return;
+		const item = this.selectedItems[0];
+		const target = this.findSelectedTarget(item);
+		if (!target) return;
+		if (item.type === "stroke") {
+			const stroke = target as StrokeAnnotation;
+			this.color = stroke.color;
+			this.width = stroke.width;
+		} else if (item.type === "text") {
+			const text = target as TextAnnotation;
+			this.color = text.color;
+			this.width = text.fontSize;
+		} else {
+			const guide = target as GuideAnnotation;
+			this.color = guide.color;
+			this.width = guide.strokeWidth;
+		}
+	}
+
+	private findSelectedTarget(item: SelectedAnnotation): StrokeAnnotation | TextAnnotation | GuideAnnotation | null {
+		const page = this.getPage(item.page);
+		if (item.type === "stroke") return page.strokes.find((target) => target.id === item.id) ?? null;
+		if (item.type === "text") return page.texts.find((target) => target.id === item.id) ?? null;
+		return page.guides.find((target) => target.id === item.id) ?? null;
 	}
 
 	private getCurrentPageNumber(): number {
@@ -443,4 +583,17 @@ export class NativePDFArtLeafState {
 		}
 		return best?.page ?? 1;
 	}
+}
+
+function isPDFArtMutation(mutation: MutationRecord): boolean {
+	const target = mutation.target;
+	if (target instanceof Element && target.closest(".pdf-art-native-overlay, .pdf-art-native-text-layer, .pdf-art-native-cursor")) {
+		return true;
+	}
+	const changedNodes = [...Array.from(mutation.addedNodes), ...Array.from(mutation.removedNodes)];
+	return changedNodes.length > 0 && changedNodes.every(isPDFArtNode);
+}
+
+function isPDFArtNode(node: Node): boolean {
+	return node instanceof Element && node.matches(".pdf-art-native-overlay, .pdf-art-native-text-layer, .pdf-art-native-cursor");
 }

@@ -1,64 +1,36 @@
-# PDF Art Annotator — Obsidian Plugin
+# Repository Guidelines
 
-An Obsidian plugin that adds a drawing/annotation overlay to the native PDF viewer. Supports freehand pen/highlighter strokes, composition guides (grid-9, grid-12, golden spiral, golden ratio, diagonals), and movable paragraph text.
+## Project Structure & Module Organization
 
-## Project
+This is an Obsidian community plugin built with TypeScript and bundled to root-level `main.js`.
 
-- **Stack:** TypeScript 5.6 + esbuild 0.24, targeting ES2022
-- **Entry:** `src/main.ts` → bundled to `main.js` (CJS)
-- **Obsidian API:** `obsidian` v1.7+, `minAppVersion: 0.15.0`
+- `src/main.ts` wires plugin lifecycle, settings, commands, ribbon actions, and workspace events.
+- `src/commands.ts`, `src/tool-view.ts`, `src/native-overlay.ts`, `src/leaf-state.ts`, and `src/page-overlay.ts` contain the command palette, right-sidebar UI, native PDF overlay scheduling, per-leaf state, and page canvas behavior.
+- `src/storage.ts` owns annotation JSON persistence under `PDF Art Annotations/`.
+- `src/types.ts` defines shared annotation and settings types.
+- `tests/` contains Vitest tests; `__mocks__/obsidian.ts` provides the Obsidian API mock.
+- Root files such as `manifest.json`, `styles.css`, `build.js`, and `versions.json` are plugin distribution/config assets.
 
-## Commands
+## Build, Test, and Development Commands
 
-| Purpose       | Command              |
-|---------------|----------------------|
-| Dev build     | `npm run dev`        |
-| Prod build    | `npm run build`      |
-| Run tests     | `npm run test`       |
+- `npm ci` installs exact dependencies from `package-lock.json`.
+- `npm run dev` runs `node build.js` with inline sourcemaps for local development.
+- `npm run typecheck` runs strict TypeScript checks without emitting files.
+- `npm run build` runs typecheck, then creates the production bundle.
+- `npm test` or `npm run test` runs the Vitest suite once.
 
-Both build commands run `node build.js`; the prod flag adds no sourcemap. Output is `main.js`. Tests use `vitest`.
+## Coding Style & Naming Conventions
 
-## Architecture
+Use TypeScript targeting ES2022 with strict mode enabled. Follow the existing style: 2-space indentation, semicolons, double-quoted imports/strings, `PascalCase` classes/types, `camelCase` functions and variables, and concise module-level constants in `SCREAMING_SNAKE_CASE` when appropriate. UI text should remain Chinese; code identifiers should remain English. Prefer Obsidian-native APIs and direct DOM integration with the native PDF viewer rather than introducing a custom viewer.
 
-```
-src/
-├── main.ts           Plugin entry, settings tab, ribbon/commands/events
-├── commands.ts       Obsidian command palette actions for tool selection and page actions
-├── tool-view.ts      Obsidian ItemView tool panel for PDF Art controls
-├── types.ts           Data types (PenStroke, TextAnnotation, GuideState, PDFArtSettings) and defaults
-├── storage.ts         AnnotationStore — JSON persistence with adapter-only writes, legacy path migration
-├── guides.ts          Canvas2D composition guide renderer (5 guide types)
-├── native-overlay.ts  NativePDFArtOverlayManager — leaf scheduling (~65 lines)
-├── leaf-state.ts      NativePDFArtLeafState — per-PDF state, data ops, page sync
-├── page-overlay.ts    NativePageOverlay — page canvas lifecycle, pointer event dispatch, gesture guard
-└── tools/
-    ├── stroke-tool.ts  Pen/highlighter stroke creation and rendering
-    ├── eraser-tool.ts  Eraser path interpolation
-    ├── text-tool.ts    Text rendering, hit testing, and editor popup
-    └── guide-tool.ts   Guide rendering, controls, hit testing, and drag geometry
-tests/
-└── storage.test.ts    Unit tests for AnnotationStore (13 tests, vitest)
-```
+## Testing Guidelines
 
-- **`PDFArtAnnotatorPlugin`** (main.ts) — wires lifecycle: loads settings, creates `AnnotationStore` and `NativePDFArtOverlayManager`, registers ribbon icon / file-menu / auto-open / commands / settings tab.
-- **`PDFArtToolView`** (tool-view.ts) — Obsidian `ItemView` shown in the right sidebar; owns the main tool UI instead of a page-level floating toolbar.
-- **`commands.ts`** — command palette actions for opening the tool view, toggling annotation mode, choosing tools/guides, and clearing the current page.
-- **`AnnotationStore`** (storage.ts) — vault-level `PDF Art Annotations/` folder of JSON files. Uses adapter-only reads/writes and migrates from legacy companion-file locations.
-- **`NativePDFArtOverlayManager`** (native-overlay.ts) — tracks `WorkspaceLeaf`→`NativePDFArtLeafState`; syncs on active-leaf / layout changes.
-- **`NativePDFArtLeafState`** (leaf-state.ts) — per-PDF state: tool selection, annotation mutations, mutation/intersection observers for page rendering. Owns per-page `NativePageOverlay` instances.
-- **`NativePageOverlay`** (page-overlay.ts) — per-page Canvas overlay lifecycle and pointer dispatch. Tool-specific drawing, hit testing, and geometry live under `src/tools/`.
-- **`guides.ts`** — pure guide geometry renderer: `grid-9`, `grid-12`, `golden-spiral`, `golden-ratio`, `diagonals`; all guide types render through shared primitives.
-- **`storage.ts`** — Uses Obsidian's `vault.adapter` directly to avoid high-frequency vault events for sync plugins. FNV-1a hash for filename disambiguation. Legacy companion-file migration on load.
+Tests use Vitest and should live in `tests/*.test.ts`. Keep unit tests focused on stable behavior and edge cases, especially storage migration, path normalization, annotation mutation, and pointer/overlay behavior when practical. Use the Obsidian mock instead of importing real app state. Run `npm test` and `npm run typecheck` before submitting changes that touch source.
 
-## Conventions
+## Commit & Pull Request Guidelines
 
-- **Language:** UI text is Chinese; code identifiers in English.
-- **Style:** strict TypeScript; `noUnusedLocals`/`noUnusedParameters` off.
-- **Pattern:** Plugin extends `Plugin`, stores data in vault via `vault.adapter`, uses `registerEvent`/`addCommand`/`addRibbonIcon` Obsidian idioms.
-- **DOM overlay:** Direct DOM injection into Obsidian's native PDF viewer (`".pdfViewer .page[data-page-number]"`), not an iframe or custom view.
-- **Coordinates:** Normalized 0–1 for annotations (multiplied by pixel dimensions at render time). Guide rects are also normalized.
-- **Storage:** This plugin intentionally uses `vault.adapter` for annotation JSON to avoid high-frequency vault events during drawing and reduce sync-plugin churn.
+Recent history uses short imperative commits, sometimes Conventional Commit prefixes such as `feat:`. Prefer `type: concise summary` when useful, for example `fix: preserve highlighter opacity`. Pull requests should include a clear behavior summary, linked issue or motivation, test results, and screenshots or short recordings for visible PDF overlay or sidebar UI changes.
 
-## Notes
+## Agent-Specific Notes
 
-- The project structure is flat: all source under `src/`, output at repo root (`main.js`). The `manifest.json` and `styles.css` are also at root for Obsidian to discover.
+Keep changes narrow. Annotation storage intentionally uses `vault.adapter` instead of `vault.create`, `vault.read`, or `vault.process` to reduce sync-plugin churn during drawing; preserve that design unless the persistence strategy is explicitly being revised. Avoid unrelated generated output churn in `main.js` unless the task is a build or release step.

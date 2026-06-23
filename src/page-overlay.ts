@@ -1,19 +1,6 @@
-import { PenStroke } from "./types";
-import { GuideRotation, GuideType } from "./guides";
-import type { NativePDFArtLeafState } from "./leaf-state";
-import { ERASER_RADIUS_DIVISOR, eraseAlongPath } from "./tools/eraser-tool";
-import {
-  drawGuideBox,
-  getGoldenSpiralTargetAspect,
-  getGuideInteractionRect,
-  GuideDragState,
-  hitGuide,
-  updateGuideDragRect,
-} from "./tools/guide-tool";
-import { canDrawWithPointer, createStroke, drawStroke } from "./tools/stroke-tool";
-import { NativeTextTool, TEXT_DRAG_THRESHOLD } from "./tools/text-tool";
-
-// ── Constants ──
+import type { NativePDFArtLeafState, SelectedAnnotation } from "./leaf-state";
+import { NormalizedPoint, StrokeAnnotation, TextAnnotation } from "./types";
+import { drawGuide, guideBounds, guideControlPoints, GuideAnnotation } from "./guides";
 
 export const ACTIVE_DRAW_GESTURE_EVENTS = [
   "touchstart",
@@ -26,19 +13,44 @@ export const ACTIVE_DRAW_GESTURE_EVENTS = [
   "contextmenu",
 ] as const;
 export const NON_PASSIVE_CAPTURE: AddEventListenerOptions = { capture: true, passive: false };
+const GUIDE_CONTROL_HIT_RADIUS = 16;
+const GUIDE_MOVE_HIT_SLOP = 18;
+type GuideResizeMode = "resize-nw" | "resize-ne" | "resize-se" | "resize-sw";
+type SelectionBox = { start: NormalizedPoint; current: NormalizedPoint };
+interface NormalizedRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
 
-// ── Page overlay ──
+type GuideDrag =
+  | { mode: "move"; id: string; startX: number; startY: number; origX: number; origY: number }
+  | { mode: "rotate"; id: string; startAngle: number; origRotation: number }
+  | {
+      mode: GuideResizeMode;
+      id: string;
+      anchorX: number;
+      anchorY: number;
+      xSign: -1 | 1;
+      ySign: -1 | 1;
+      rotation: number;
+    };
 
 export class NativePageOverlay {
   private canvas = document.createElement("canvas");
+  private textLayer = document.createElement("div");
+  private cursor = document.createElement("div");
   private ctx = this.canvas.getContext("2d")!;
   private resizeObserver: ResizeObserver;
   private previousPosition = "";
-  private currentStroke: PenStroke | null = null;
-  private guideDrag: GuideDragState | null = null;
-  private textDrag: { index: number; startX: number; startY: number; origX: number; origY: number; moved: boolean } | null = null;
-  private eraserDrag: { radius: number; lastX: number; lastY: number; changed: boolean } | null = null;
-  private textTool: NativeTextTool;
+  private currentStroke: StrokeAnnotation | null = null;
+  private textEditor: HTMLElement | null = null;
+  private finishTextEditor: (() => void) | null = null;
+  private textDrag: { id: string; startX: number; startY: number; origX: number; origY: number; moved: boolean } | null = null;
+  private guideDrag: GuideDrag | null = null;
+  private selectionBox: SelectionBox | null = null;
+  private eraserChanged = false;
   private activeDrawPointerId: number | null = null;
   private activeDrawGestureGuardInstalled = false;
 
@@ -47,16 +59,22 @@ export class NativePageOverlay {
     private readonly pageNumber: number,
     private readonly wrapper: HTMLElement
   ) {
-    this.textTool = new NativeTextTool(this.ctx, this.wrapper, this.manager, this.pageNumber, () => this.getPageWidth());
     this.canvas.className = "pdf-art-native-overlay";
+    this.textLayer.className = "pdf-art-native-text-layer";
+    this.cursor.className = "pdf-art-native-cursor";
     this.previousPosition = wrapper.style.position;
     if (getComputedStyle(wrapper).position === "static") wrapper.style.position = "relative";
     wrapper.appendChild(this.canvas);
+    wrapper.appendChild(this.textLayer);
+    wrapper.appendChild(this.cursor);
+    this.textLayer.addEventListener("pointerdown", this.onTextLayerPointerDown);
+    this.canvas.addEventListener("pointerenter", this.onPointerEnter);
+    this.canvas.addEventListener("pointerleave", this.onPointerLeave);
     this.canvas.addEventListener("pointerdown", this.onPointerDown);
     this.canvas.addEventListener("pointermove", this.onPointerMove);
     this.canvas.addEventListener("pointerup", this.onPointerUp);
     this.canvas.addEventListener("pointercancel", this.onPointerUp);
-    this.canvas.addEventListener("dblclick", this.onDoubleClick);
+    window.addEventListener("keydown", this.onKeyDown);
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(wrapper);
     this.resize();
@@ -64,35 +82,42 @@ export class NativePageOverlay {
 
   usesWrapper(wrapper: HTMLElement) { return this.wrapper === wrapper; }
 
-  getPageWidth() {
-    return this.wrapper.getBoundingClientRect().width;
-  }
-
-  closeTextEditor() {
-    this.textTool.closeEditor();
-  }
-
   destroy() {
     this.resizeObserver.disconnect();
+    this.textLayer.removeEventListener("pointerdown", this.onTextLayerPointerDown);
+    this.canvas.removeEventListener("pointerenter", this.onPointerEnter);
+    this.canvas.removeEventListener("pointerleave", this.onPointerLeave);
     this.canvas.removeEventListener("pointerdown", this.onPointerDown);
     this.canvas.removeEventListener("pointermove", this.onPointerMove);
     this.canvas.removeEventListener("pointerup", this.onPointerUp);
     this.canvas.removeEventListener("pointercancel", this.onPointerUp);
-    this.canvas.removeEventListener("dblclick", this.onDoubleClick);
-    // Always clean up window-level gesture guards, even if state flags are inconsistent
+    window.removeEventListener("keydown", this.onKeyDown);
+    window.removeEventListener("pointermove", this.onTextPointerMove);
+    window.removeEventListener("pointerup", this.onTextPointerUp);
+    window.removeEventListener("pointermove", this.onGuidePointerMove);
+    window.removeEventListener("pointerup", this.onGuidePointerUp);
     for (const eventName of ACTIVE_DRAW_GESTURE_EVENTS) {
       window.removeEventListener(eventName, this.blockActiveDrawCompatibilityGesture, NON_PASSIVE_CAPTURE);
     }
     this.activeDrawPointerId = null;
     this.activeDrawGestureGuardInstalled = false;
-    this.closeTextEditor();
+    this.finishTextEditor = null;
+    this.textEditor?.remove();
+    this.textLayer.remove();
+    this.cursor.remove();
     this.canvas.remove();
     this.wrapper.style.position = this.previousPosition;
   }
 
   refreshState() {
     this.canvas.toggleClass("is-enabled", this.manager.getEnabled());
+    this.canvas.toggleClass("is-text-tool", this.manager.getTool() === "text");
+    this.textLayer.toggleClass("is-enabled", this.manager.getEnabled());
+    this.textLayer.toggleClass("is-text-tool", this.manager.getTool() === "text");
     this.canvas.dataset.tool = this.manager.getTool();
+    this.cursor.dataset.tool = this.manager.getTool();
+    this.updateCursorStyle();
+    if (!this.manager.getEnabled()) this.hideCursor();
   }
 
   render() {
@@ -101,17 +126,18 @@ export class NativePageOverlay {
     const h = rect.height;
     this.ctx.clearRect(0, 0, w, h);
     const page = this.manager.getPage(this.pageNumber);
-    page.items.forEach((item, index) => {
-      if (item.type === "text") this.textTool.drawText(item, w, h, index);
-      else drawStroke(this.ctx, item, w, h);
-    });
-    if (this.currentStroke) drawStroke(this.ctx, this.currentStroke, w, h);
-    for (const guide of page.guides) drawGuideBox(this.ctx, this.manager, guide, w, h);
+    const strokes = this.currentStroke ? [...page.strokes, this.currentStroke] : page.strokes;
+    drawStrokes(this.ctx, strokes, w, h);
+    for (const guide of page.guides) {
+      drawGuide(this.ctx, guide, w, h, this.manager.isSelected(this.pageNumber, "guide", guide.id));
+    }
+    this.drawSelectionFrames(w, h);
+    if (this.selectionBox) drawSelectionBox(this.ctx, this.selectionBox, w, h);
+    this.renderTextLayer(w, h);
   }
 
   private resize() {
     const rect = this.wrapper.getBoundingClientRect();
-    this.textTool.updateBaseWidth(rect.width);
     const dpr = window.devicePixelRatio || 1;
     this.canvas.style.width = `${rect.width}px`;
     this.canvas.style.height = `${rect.height}px`;
@@ -121,7 +147,7 @@ export class NativePageOverlay {
     this.render();
   }
 
-  private point(event: PointerEvent) {
+  private point(event: PointerEvent): NormalizedPoint {
     const rect = this.canvas.getBoundingClientRect();
     return {
       x: Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)),
@@ -130,91 +156,68 @@ export class NativePageOverlay {
     };
   }
 
+  private readonly onPointerEnter = (event: PointerEvent) => {
+    this.updateCursor(event);
+  };
+
+  private readonly onPointerLeave = () => {
+    this.hideCursor();
+  };
+
+  private readonly onTextLayerPointerDown = (event: PointerEvent) => {
+    if (!this.manager.getEnabled() || this.manager.getTool() !== "text") return;
+    if (event.target !== this.textLayer) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (this.finishTextEditor) {
+      this.finishTextEditor();
+      return;
+    }
+    const rect = this.textLayer.getBoundingClientRect();
+    const x = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+    const y = Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height));
+    this.openTextEditor(x, y);
+  };
+
   private readonly onPointerDown = (event: PointerEvent) => {
     if (!this.manager.getEnabled()) return;
-    if (event.pointerType === "touch") return;
-    const p = this.point(event);
     const tool = this.manager.getTool();
-    const guideHit = hitGuide(this.manager, this.wrapper, this.pageNumber, p.x, p.y);
-    if (guideHit) {
+    if (tool === "text") return;
+    if (!canDrawWithPointer(event)) return;
+    this.updateCursor(event);
+    const point = this.point(event);
+    if (tool === "select") {
       event.preventDefault();
       event.stopPropagation();
-      this.manager.selectGuide(this.pageNumber, guideHit.id);
-      const page = this.manager.getPage(this.pageNumber);
-      const guide = page.guides.find((g) => g._id === guideHit.id);
-      if (!guide) return;
-      if (guideHit.mode === "delete") {
-        void this.manager.removeGuide(this.pageNumber, guideHit.id);
+      const hit = this.hitSelectable(point.x, point.y);
+      if (hit) {
+        this.manager.selectItems([hit]);
         return;
       }
-      if (guideHit.mode === "rotate") {
-        const rotation = (((guide.rotation ?? 1) + 1) % 4) as GuideRotation;
-        void this.manager.updateGuide(this.pageNumber, guideHit.id, { rotation });
-        return;
-      }
-      if (guideHit.mode === "mirror-x") {
-        void this.manager.updateGuide(this.pageNumber, guideHit.id, { mirrorX: !guide.mirrorX });
-        return;
-      }
-      if (guideHit.mode === "mirror-y") {
-        void this.manager.updateGuide(this.pageNumber, guideHit.id, { mirrorY: !guide.mirrorY });
-        return;
-      }
-      const rect = getGuideInteractionRect(this.wrapper, guide);
-      const pageRect = this.wrapper.getBoundingClientRect();
-      const aspect = guide.type === "golden-spiral" && pageRect.width > 0
-        ? getGoldenSpiralTargetAspect(guide) * (pageRect.height / pageRect.width)
-        : undefined;
-      this.guideDrag = { id: guideHit.id, mode: guideHit.mode, startX: p.x, startY: p.y, rect, aspect };
+      this.selectionBox = { start: point, current: point };
       this.beginDrawGestureGuard(event);
       this.canvas.setPointerCapture(event.pointerId);
-      return;
-    }
-
-    if (tool === "text") {
-      event.preventDefault();
-      event.stopPropagation();
-      const textHit = this.textTool.hitText(p.x, p.y);
-      if (textHit) {
-        if (textHit.mode === "delete") {
-          void this.manager.removeText(this.pageNumber, textHit.index);
-          return;
-        }
-        const item = this.manager.getPage(this.pageNumber).items[textHit.index];
-        if (item?.type === "text") {
-          this.manager.selectText(this.pageNumber, textHit.index);
-          this.textDrag = { index: textHit.index, startX: p.x, startY: p.y, origX: item.x, origY: item.y, moved: false };
-          this.beginDrawGestureGuard(event);
-          this.canvas.setPointerCapture(event.pointerId);
-          return;
-        }
-      }
-      this.textTool.openEditor(p.x, p.y);
-      return;
-    }
-    if (tool === "eraser") {
-      if (!canDrawWithPointer(event)) return;
-      event.preventDefault();
-      event.stopPropagation();
-      this.eraserDrag = { radius: this.manager.getWidth() / ERASER_RADIUS_DIVISOR, lastX: p.x, lastY: p.y, changed: true };
-      this.beginDrawGestureGuard(event);
-      this.canvas.setPointerCapture(event.pointerId);
-      const eraserRect = this.wrapper.getBoundingClientRect();
-      void this.manager.eraseAt(this.pageNumber, p.x, p.y, this.eraserDrag.radius, { save: false, pageWidth: eraserRect.width, pageHeight: eraserRect.height });
+      this.render();
       return;
     }
     if (tool === "guide") {
-      if (!canDrawWithPointer(event)) return;
       event.preventDefault();
       event.stopPropagation();
-      void this.manager.addGuide(this.pageNumber, p.x, p.y);
+      this.handleGuidePointerDown(event, point.x, point.y);
+      return;
+    }
+    if (tool === "eraser") {
+      event.preventDefault();
+      event.stopPropagation();
+      this.eraserChanged = this.manager.eraseAt(this.pageNumber, point.x, point.y, this.wrapper, { save: false });
+      this.beginDrawGestureGuard(event);
+      this.canvas.setPointerCapture(event.pointerId);
       return;
     }
 
-    if (!canDrawWithPointer(event)) return;
     event.preventDefault();
     event.stopPropagation();
-    this.currentStroke = createStroke(tool === "highlighter" ? "highlighter" : "pen", this.manager.getColor(), this.manager.getWidth(), p);
+    this.currentStroke = createStroke(tool, this.manager.getColor(), this.manager.getWidth(), point);
     this.beginDrawGestureGuard(event);
     this.canvas.setPointerCapture(event.pointerId);
     this.render();
@@ -222,74 +225,55 @@ export class NativePageOverlay {
 
   private readonly onPointerMove = (event: PointerEvent) => {
     if (this.activeDrawPointerId !== null && event.pointerId !== this.activeDrawPointerId) return;
-    const p = this.point(event);
-    if (this.guideDrag) {
+    this.updateCursor(event);
+    const point = this.point(event);
+    if (this.manager.getTool() === "eraser" && this.activeDrawPointerId !== null) {
       event.preventDefault();
       event.stopPropagation();
-      const r = updateGuideDragRect(this.guideDrag, p.x, p.y);
-      void this.manager.updateGuide(this.pageNumber, this.guideDrag.id, { rect: r }, { save: false });
+      this.eraserChanged = this.manager.eraseAt(this.pageNumber, point.x, point.y, this.wrapper, { save: false }) || this.eraserChanged;
       return;
     }
-    if (this.textDrag) {
+    if (this.manager.getTool() === "select" && this.activeDrawPointerId !== null && this.selectionBox) {
       event.preventDefault();
       event.stopPropagation();
-      const dx = p.x - this.textDrag.startX;
-      const dy = p.y - this.textDrag.startY;
-      const item = this.manager.getPage(this.pageNumber).items[this.textDrag.index];
-      if (item?.type === "text") {
-        item.x = Math.min(0.98, Math.max(0, this.textDrag.origX + dx));
-        item.y = Math.min(0.98, Math.max(0, this.textDrag.origY + dy));
-        this.textDrag.moved = this.textDrag.moved || Math.abs(dx) + Math.abs(dy) > TEXT_DRAG_THRESHOLD;
-        this.render();
-      }
+      this.selectionBox.current = point;
+      this.render();
       return;
     }
-    if (this.eraserDrag) {
-      event.preventDefault();
-      event.stopPropagation();
-      this.eraserDrag.changed = true;
-      eraseAlongPath(this.manager, this.pageNumber, this.wrapper, this.eraserDrag.lastX, this.eraserDrag.lastY, p.x, p.y, this.eraserDrag.radius);
-      this.eraserDrag.lastX = p.x;
-      this.eraserDrag.lastY = p.y;
-      return;
-    }
+    if (this.manager.getTool() === "guide") return;
     if (!this.currentStroke) return;
     event.preventDefault();
     event.stopPropagation();
-    this.currentStroke.points.push(p);
+    this.currentStroke.points.push(point);
     this.render();
   };
 
   private readonly onPointerUp = (event: PointerEvent) => {
     if (this.activeDrawPointerId !== null && event.pointerId !== this.activeDrawPointerId) return;
-    if (this.guideDrag) {
+    this.updateCursor(event);
+    if (this.manager.getTool() === "eraser" && this.activeDrawPointerId !== null) {
       event.preventDefault();
       event.stopPropagation();
       try { this.canvas.releasePointerCapture(event.pointerId); } catch {}
-      void this.manager.save();
-      this.guideDrag = null;
+      if (this.eraserChanged) void this.manager.save();
+      this.eraserChanged = false;
       this.endDrawGestureGuard(event.pointerId);
       return;
     }
-    if (this.textDrag) {
+    if (this.manager.getTool() === "select" && this.activeDrawPointerId !== null) {
       event.preventDefault();
       event.stopPropagation();
       try { this.canvas.releasePointerCapture(event.pointerId); } catch {}
-      if (this.textDrag.moved) void this.manager.save();
-      this.textDrag = null;
+      if (this.selectionBox) {
+        const items = this.itemsInSelection(this.selectionBox);
+        this.selectionBox = null;
+        this.manager.selectItems(items);
+      }
       this.endDrawGestureGuard(event.pointerId);
       this.render();
       return;
     }
-    if (this.eraserDrag) {
-      event.preventDefault();
-      event.stopPropagation();
-      try { this.canvas.releasePointerCapture(event.pointerId); } catch {}
-      if (this.eraserDrag.changed) void this.manager.save();
-      this.eraserDrag = null;
-      this.endDrawGestureGuard(event.pointerId);
-      return;
-    }
+    if (this.manager.getTool() === "guide") return;
     if (!this.currentStroke) return;
     event.preventDefault();
     event.stopPropagation();
@@ -299,6 +283,17 @@ export class NativePageOverlay {
     this.endDrawGestureGuard(event.pointerId);
     void this.manager.addStroke(this.pageNumber, stroke);
     this.render();
+  };
+
+  private readonly onKeyDown = (event: KeyboardEvent) => {
+    if (!this.manager.getEnabled() || this.manager.getTool() !== "select") return;
+    if (event.key !== "Delete" && event.key !== "Backspace") return;
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    if (isEditableTarget(event.target)) return;
+    if (!this.manager.getSelection().some((item) => item.page === this.pageNumber)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    void this.manager.deleteSelection();
   };
 
   private beginDrawGestureGuard(event: PointerEvent) {
@@ -322,16 +317,682 @@ export class NativePageOverlay {
     this.activeDrawGestureGuardInstalled = false;
   }
 
+  private renderTextLayer(pageWidth: number, pageHeight: number) {
+    const editor = this.textEditor;
+    const editingId = editor?.dataset.textId ?? null;
+    const existingEditorParent = editor?.parentElement;
+    for (const child of Array.from(this.textLayer.children)) {
+      if (child !== editor) child.remove();
+    }
+    for (const text of this.manager.getPage(this.pageNumber).texts) {
+      if (text.id === editingId) continue;
+      const box = this.textLayer.createDiv({ cls: "pdf-art-native-text-box" });
+      box.dataset.id = text.id;
+      box.style.left = `${text.x * pageWidth}px`;
+      box.style.top = `${text.y * pageHeight}px`;
+      box.style.width = `${text.width * pageWidth}px`;
+      box.style.color = text.color;
+      box.style.fontSize = `${text.fontSize}px`;
+      box.setText(text.text);
+      box.toggleClass("is-selected", this.manager.isSelected(this.pageNumber, "text", text.id));
+      box.addEventListener("pointerdown", (event) => this.onTextPointerDown(event, text));
+      if (this.manager.getTool() === "text") {
+        const remove = box.createEl("button", { cls: "pdf-art-native-text-remove", text: "×" });
+        remove.type = "button";
+        remove.addEventListener("pointerdown", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        });
+        remove.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          void this.manager.removeText(this.pageNumber, text.id);
+        });
+      }
+    }
+    if (editor && existingEditorParent !== this.textLayer) {
+      this.textLayer.appendChild(editor);
+    }
+  }
+
+  private onTextPointerDown(event: PointerEvent, text: TextAnnotation) {
+    if (!this.manager.getEnabled() || this.manager.getTool() !== "text") return;
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = this.wrapper.getBoundingClientRect();
+    this.textDrag = {
+      id: text.id,
+      startX: event.clientX,
+      startY: event.clientY,
+      origX: text.x,
+      origY: text.y,
+      moved: false,
+    };
+    this.beginDrawGestureGuard(event);
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    window.addEventListener("pointermove", this.onTextPointerMove);
+    window.addEventListener("pointerup", this.onTextPointerUp);
+  }
+
+  private readonly onTextPointerMove = (event: PointerEvent) => {
+    if (!this.textDrag) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = this.wrapper.getBoundingClientRect();
+    const dx = rect.width > 0 ? (event.clientX - this.textDrag.startX) / rect.width : 0;
+    const dy = rect.height > 0 ? (event.clientY - this.textDrag.startY) / rect.height : 0;
+    const x = Math.min(0.98, Math.max(0, this.textDrag.origX + dx));
+    const y = Math.min(0.98, Math.max(0, this.textDrag.origY + dy));
+    this.textDrag.moved = this.textDrag.moved || Math.abs(dx) + Math.abs(dy) > 0.004;
+    void this.manager.updateText(this.pageNumber, this.textDrag.id, { x, y }, { save: false });
+  };
+
+  private readonly onTextPointerUp = (event: PointerEvent) => {
+    if (!this.textDrag) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const drag = this.textDrag;
+    this.textDrag = null;
+    window.removeEventListener("pointermove", this.onTextPointerMove);
+    window.removeEventListener("pointerup", this.onTextPointerUp);
+    this.endDrawGestureGuard(event.pointerId);
+    const text = this.manager.getPage(this.pageNumber).texts.find((item) => item.id === drag.id);
+    if (!text) return;
+    if (drag.moved) {
+      void this.manager.save();
+    } else {
+      this.openTextEditor(text.x, text.y, text);
+    }
+  };
+
+  private handleGuidePointerDown(event: PointerEvent, x: number, y: number) {
+    const hit = this.hitGuide(x, y);
+    if (!hit) {
+      void this.manager.addGuide(this.pageNumber, x, y);
+      return;
+    }
+    this.manager.selectGuide(this.pageNumber, hit.guide.id);
+    if (hit.mode === "delete") {
+      void this.manager.removeGuide(this.pageNumber, hit.guide.id);
+      return;
+    }
+    if (hit.mode === "mirror-x") {
+      void this.manager.updateGuide(this.pageNumber, hit.guide.id, { mirrorX: !hit.guide.mirrorX });
+      return;
+    }
+    if (hit.mode === "mirror-y") {
+      void this.manager.updateGuide(this.pageNumber, hit.guide.id, { mirrorY: !hit.guide.mirrorY });
+      return;
+    }
+    if (hit.mode === "rotate") {
+      this.guideDrag = {
+        mode: "rotate",
+        id: hit.guide.id,
+        startAngle: this.guidePointerAngle(hit.guide, event),
+        origRotation: hit.guide.rotation,
+      };
+    } else if (isGuideResizeMode(hit.mode)) {
+      this.guideDrag = this.createGuideResizeDrag(hit.guide, hit.mode);
+    } else {
+      this.guideDrag = {
+        mode: "move",
+        id: hit.guide.id,
+        startX: x,
+        startY: y,
+        origX: hit.guide.x,
+        origY: hit.guide.y,
+      };
+    }
+    this.beginDrawGestureGuard(event);
+    this.canvas.setPointerCapture(event.pointerId);
+    window.addEventListener("pointermove", this.onGuidePointerMove);
+    window.addEventListener("pointerup", this.onGuidePointerUp);
+  }
+
+  private readonly onGuidePointerMove = (event: PointerEvent) => {
+    const drag = this.guideDrag;
+    if (!drag) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const point = this.point(event);
+    const guide = this.manager.getPage(this.pageNumber).guides.find((item) => item.id === drag.id);
+    if (!guide) return;
+    if (drag.mode === "rotate") {
+      void this.rotateGuideFromPointer(guide, event, drag);
+      return;
+    }
+    if (isGuideResizeMode(drag.mode)) {
+      void this.resizeGuideFromPointer(guide, event, drag.mode);
+      return;
+    }
+    if (drag.mode !== "move") return;
+    const dx = point.x - drag.startX;
+    const dy = point.y - drag.startY;
+    void this.manager.updateGuide(this.pageNumber, guide.id, {
+      x: Math.min(1 - guide.width, Math.max(0, drag.origX + dx)),
+      y: Math.min(1 - guide.height, Math.max(0, drag.origY + dy)),
+    }, { save: false });
+  };
+
+  private readonly onGuidePointerUp = (event: PointerEvent) => {
+    if (!this.guideDrag) return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.guideDrag = null;
+    window.removeEventListener("pointermove", this.onGuidePointerMove);
+    window.removeEventListener("pointerup", this.onGuidePointerUp);
+    try { this.canvas.releasePointerCapture(event.pointerId); } catch {}
+    this.endDrawGestureGuard(event.pointerId);
+    void this.manager.save();
+  };
+
+  private hitGuide(x: number, y: number): { guide: GuideAnnotation; mode: "move" | "delete" | "rotate" | GuideResizeMode | "mirror-x" | "mirror-y" } | null {
+    const page = this.manager.getPage(this.pageNumber);
+    const rect = this.wrapper.getBoundingClientRect();
+    const px = x * rect.width;
+    const py = y * rect.height;
+    const near = (point: { x: number; y: number }) => Math.hypot(px - point.x, py - point.y) <= GUIDE_CONTROL_HIT_RADIUS;
+    for (let i = page.guides.length - 1; i >= 0; i -= 1) {
+      const guide = page.guides[i];
+      const controls = guideControlPoints(guide, rect.width, rect.height);
+      if (near(controls.delete)) return { guide, mode: "delete" };
+      if (near(controls.rotate)) return { guide, mode: "rotate" };
+      if (near(controls.resizeNW)) return { guide, mode: "resize-nw" };
+      if (near(controls.resizeNE)) return { guide, mode: "resize-ne" };
+      if (near(controls.resizeSE)) return { guide, mode: "resize-se" };
+      if (near(controls.resizeSW)) return { guide, mode: "resize-sw" };
+      if (near(controls.mirrorX)) return { guide, mode: "mirror-x" };
+      if (near(controls.mirrorY)) return { guide, mode: "mirror-y" };
+      const bounds = guideBounds(guide, rect.width, rect.height);
+      const cx = bounds.x + bounds.w / 2;
+      const cy = bounds.y + bounds.h / 2;
+      const local = inverseRotatePoint(px, py, cx, cy, guide.rotation);
+      const inside = Math.abs(local.x - cx) <= bounds.w / 2 + GUIDE_MOVE_HIT_SLOP
+        && Math.abs(local.y - cy) <= bounds.h / 2 + GUIDE_MOVE_HIT_SLOP;
+      if (inside) return { guide, mode: "move" };
+    }
+    return null;
+  }
+
+  private rotateGuideFromPointer(guide: GuideAnnotation, event: PointerEvent, drag: Extract<GuideDrag, { mode: "rotate" }>) {
+    const rect = this.wrapper.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const angle = this.guidePointerAngle(guide, event);
+    return this.manager.updateGuide(this.pageNumber, guide.id, {
+      rotation: normalizeAngle(drag.origRotation + angle - drag.startAngle),
+    }, { save: false });
+  }
+
+  private createGuideResizeDrag(guide: GuideAnnotation, mode: GuideResizeMode): Extract<GuideDrag, { mode: GuideResizeMode }> {
+    const rect = this.wrapper.getBoundingClientRect();
+    const bounds = guideBounds(guide, rect.width, rect.height);
+    const cx = bounds.x + bounds.w / 2;
+    const cy = bounds.y + bounds.h / 2;
+    const xSign = mode.endsWith("e") ? 1 : -1;
+    const ySign = mode.includes("s") ? 1 : -1;
+    const anchor = rotatePoint(cx - xSign * bounds.w / 2, cy - ySign * bounds.h / 2, cx, cy, guide.rotation);
+    return {
+      mode,
+      id: guide.id,
+      anchorX: anchor.x,
+      anchorY: anchor.y,
+      xSign,
+      ySign,
+      rotation: guide.rotation,
+    };
+  }
+
+  private resizeGuideFromPointer(guide: GuideAnnotation, event: PointerEvent, mode: GuideResizeMode) {
+    const rect = this.wrapper.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const drag = this.guideDrag;
+    if (!drag || drag.mode !== mode || !isGuideResizeMode(drag.mode)) return;
+    const ux = { x: Math.cos(drag.rotation), y: Math.sin(drag.rotation) };
+    const uy = { x: -Math.sin(drag.rotation), y: Math.cos(drag.rotation) };
+    const dx = event.clientX - rect.left - drag.anchorX;
+    const dy = event.clientY - rect.top - drag.anchorY;
+    const projectedX = dx * ux.x + dy * ux.y;
+    const projectedY = dx * uy.x + dy * uy.y;
+    const minW = 48 / rect.width;
+    const minH = 48 / rect.height;
+    const width = Math.min(1, Math.max(minW, (drag.xSign * projectedX) / rect.width));
+    const height = Math.min(1, Math.max(minH, (drag.ySign * projectedY) / rect.height));
+    const centerPxX = drag.anchorX + (drag.xSign * width * rect.width * ux.x + drag.ySign * height * rect.height * uy.x) / 2;
+    const centerPxY = drag.anchorY + (drag.xSign * width * rect.width * ux.y + drag.ySign * height * rect.height * uy.y) / 2;
+    const centerX = Math.min(1, Math.max(0, centerPxX / rect.width));
+    const centerY = Math.min(1, Math.max(0, centerPxY / rect.height));
+    return this.manager.updateGuide(this.pageNumber, guide.id, {
+      x: centerX - width / 2,
+      y: centerY - height / 2,
+      width,
+      height,
+    }, { save: false });
+  }
+
+  private guidePointerAngle(guide: GuideAnnotation, event: PointerEvent) {
+    const rect = this.wrapper.getBoundingClientRect();
+    const bounds = guideBounds(guide, rect.width, rect.height);
+    const cx = rect.left + bounds.x + bounds.w / 2;
+    const cy = rect.top + bounds.y + bounds.h / 2;
+    return Math.atan2(event.clientY - cy, event.clientX - cx);
+  }
+
+  private hitSelectable(x: number, y: number): SelectedAnnotation | null {
+    const page = this.manager.getPage(this.pageNumber);
+    const rect = this.wrapper.getBoundingClientRect();
+    const px = x * rect.width;
+    const py = y * rect.height;
+    for (let i = page.guides.length - 1; i >= 0; i -= 1) {
+      const guide = page.guides[i];
+      const bounds = guideBounds(guide, rect.width, rect.height);
+      const cx = bounds.x + bounds.w / 2;
+      const cy = bounds.y + bounds.h / 2;
+      const local = inverseRotatePoint(px, py, cx, cy, guide.rotation);
+      if (Math.abs(local.x - cx) <= bounds.w / 2 + GUIDE_MOVE_HIT_SLOP && Math.abs(local.y - cy) <= bounds.h / 2 + GUIDE_MOVE_HIT_SLOP) {
+        return { page: this.pageNumber, type: "guide", id: guide.id };
+      }
+    }
+    for (let i = page.texts.length - 1; i >= 0; i -= 1) {
+      const text = page.texts[i];
+      if (pointInRect({ x, y }, textBounds(text, rect.width, rect.height))) {
+        return { page: this.pageNumber, type: "text", id: text.id };
+      }
+    }
+    for (let i = page.strokes.length - 1; i >= 0; i -= 1) {
+      const stroke = page.strokes[i];
+      const hitRadius = Math.max(10, stroke.width + 6);
+      if (strokeHit(stroke, px, py, hitRadius, rect.width, rect.height)) {
+        return { page: this.pageNumber, type: "stroke", id: stroke.id };
+      }
+    }
+    return null;
+  }
+
+  private itemsInSelection(box: SelectionBox): SelectedAnnotation[] {
+    const page = this.manager.getPage(this.pageNumber);
+    const rect = this.wrapper.getBoundingClientRect();
+    const selection = normalizedRectFromPoints(box.start, box.current);
+    const items: SelectedAnnotation[] = [];
+    for (const stroke of page.strokes) {
+      if (rectContainsRect(selection, strokeBounds(stroke))) items.push({ page: this.pageNumber, type: "stroke", id: stroke.id });
+    }
+    for (const text of page.texts) {
+      if (rectContainsRect(selection, textBounds(text, rect.width, rect.height))) items.push({ page: this.pageNumber, type: "text", id: text.id });
+    }
+    for (const guide of page.guides) {
+      if (rectContainsRect(selection, guideBoundsNormalized(guide, rect.width, rect.height))) items.push({ page: this.pageNumber, type: "guide", id: guide.id });
+    }
+    return items;
+  }
+
+  private drawSelectionFrames(pageWidth: number, pageHeight: number) {
+    for (const item of this.manager.getSelection()) {
+      if (item.page !== this.pageNumber || item.type === "guide") continue;
+      const page = this.manager.getPage(this.pageNumber);
+      const bounds = item.type === "stroke"
+        ? strokeBounds(page.strokes.find((stroke) => stroke.id === item.id) ?? null)
+        : textBounds(page.texts.find((text) => text.id === item.id) ?? null, pageWidth, pageHeight);
+      if (!bounds) continue;
+      drawSelectionRect(this.ctx, bounds, pageWidth, pageHeight);
+    }
+  }
+
+  private openTextEditor(x: number, y: number, existing?: TextAnnotation) {
+    if (this.finishTextEditor) this.finishTextEditor();
+    else this.textEditor?.remove();
+    this.finishTextEditor = null;
+    const editor = document.createElement("div");
+    editor.className = "pdf-art-native-text-editor";
+    editor.dataset.textId = existing?.id ?? "";
+    editor.style.left = `${x * 100}%`;
+    editor.style.top = `${y * 100}%`;
+    editor.style.width = `${(existing?.width ?? 0.28) * 100}%`;
+    const isolate = (event: Event) => {
+      event.stopPropagation();
+    };
+    for (const eventName of ["pointerdown", "pointermove", "pointerup", "mousedown", "mouseup", "click", "touchstart", "touchmove", "touchend"]) {
+      editor.addEventListener(eventName, isolate);
+    }
+
+    const textarea = editor.createEl("textarea", { cls: "pdf-art-native-textarea" });
+    textarea.placeholder = "输入文字";
+    textarea.value = existing?.text ?? "";
+    textarea.style.color = existing?.color ?? this.manager.getColor();
+    textarea.style.fontSize = `${existing?.fontSize ?? this.manager.getWidth()}px`;
+    const textId = existing?.id ?? null;
+    const applyStyle = (style: { color: string; fontSize: number }) => {
+      textarea.style.color = style.color;
+      textarea.style.fontSize = `${style.fontSize}px`;
+    };
+    this.manager.beginTextEdit(this.pageNumber, textId, {
+      color: existing?.color ?? this.manager.getColor(),
+      fontSize: existing?.fontSize ?? this.manager.getWidth(),
+    }, applyStyle);
+
+    const actions = editor.createDiv({ cls: "pdf-art-native-text-actions" });
+    const cancel = actions.createEl("button", { text: "取消" });
+    cancel.type = "button";
+    const ok = actions.createEl("button", { text: "确定" });
+    ok.type = "button";
+    ok.addClass("mod-cta");
+
+    let closed = false;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      editor.remove();
+      if (this.textEditor === editor) this.textEditor = null;
+      if (this.finishTextEditor === submit) this.finishTextEditor = null;
+      this.manager.endTextEdit(this.pageNumber, textId);
+      this.render();
+    };
+    const submit = () => {
+      const value = textarea.value.trim();
+      const wrapperWidth = this.wrapper.getBoundingClientRect().width;
+      const editorWidth = editor.getBoundingClientRect().width;
+      const width = wrapperWidth > 0 ? Math.min(0.9, Math.max(0.08, editorWidth / wrapperWidth)) : existing?.width ?? 0.28;
+      if (existing) {
+        void this.manager.updateText(this.pageNumber, existing.id, { text: value, width, color: this.manager.getColor(), fontSize: this.manager.getWidth() }).then(close);
+      } else if (value) {
+        void this.manager.addText(this.pageNumber, x, y, value, width).then(close);
+      } else {
+        close();
+      }
+    };
+    this.finishTextEditor = submit;
+    cancel.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      close();
+    });
+    ok.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      submit();
+    });
+    textarea.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        close();
+      } else if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+        event.preventDefault();
+        submit();
+      }
+    });
+    this.textEditor = editor;
+    this.textLayer.appendChild(editor);
+    window.setTimeout(() => {
+      if (!editor.isConnected) return;
+      textarea.focus();
+      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+    }, 0);
+  }
+
+  private updateCursor(event: PointerEvent) {
+    if (!this.manager.getEnabled() || !canDrawWithPointer(event)) {
+      this.hideCursor();
+      return;
+    }
+    const rect = this.wrapper.getBoundingClientRect();
+    this.updateCursorStyle();
+    this.cursor.style.transform = `translate(${event.clientX - rect.left}px, ${event.clientY - rect.top}px) translate(-50%, -50%)`;
+    this.cursor.addClass("is-visible");
+  }
+
+  private hideCursor() {
+    this.cursor.removeClass("is-visible");
+  }
+
+  private updateCursorStyle() {
+    const tool = this.manager.getTool();
+    if (tool === "select") {
+      this.cursor.style.width = "18px";
+      this.cursor.style.height = "18px";
+      this.cursor.style.color = "var(--interactive-accent)";
+      this.cursor.style.borderColor = "var(--interactive-accent)";
+      this.cursor.style.backgroundColor = "transparent";
+      return;
+    }
+    const width = Math.max(1, tool === "text" ? 2 : this.manager.getWidth());
+    const height = Math.max(1, tool === "text" ? this.manager.getWidth() : this.manager.getWidth());
+    const color = tool === "eraser" ? "var(--text-muted)" : this.manager.getColor();
+    this.cursor.style.width = `${width}px`;
+    this.cursor.style.height = `${height}px`;
+    this.cursor.style.color = color;
+    this.cursor.style.borderColor = color;
+    this.cursor.style.backgroundColor = tool === "text" ? color : tool === "highlighter" ? colorToRgba(this.manager.getColor(), 0.28) : "transparent";
+  }
+
   private readonly blockActiveDrawCompatibilityGesture = (event: Event) => {
     if (this.activeDrawPointerId === null) return;
     const target = event.target instanceof Element ? event.target : null;
-    if (target?.closest(".pdf-art-native-text-editor, button, input, textarea, select, a, [contenteditable='true']")) return;
+    if (target?.closest("button, input, textarea, select, a, [contenteditable='true']")) return;
     event.preventDefault();
     event.stopPropagation();
     if ("stopImmediatePropagation" in event) event.stopImmediatePropagation();
   };
+}
 
-  private readonly onDoubleClick = (event: MouseEvent) => {
-    this.textTool.handleDoubleClick(event, this.canvas);
+function canDrawWithPointer(event: PointerEvent): boolean {
+  return event.pointerType === "pen" || event.pointerType === "mouse";
+}
+
+function colorToRgba(color: string, alpha: number): string {
+  const hex = color.trim();
+  const short = /^#([0-9a-f]{3})$/i.exec(hex);
+  if (short) {
+    const [r, g, b] = short[1].split("").map((value) => parseInt(value + value, 16));
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  }
+  const full = /^#([0-9a-f]{6})$/i.exec(hex);
+  if (full) {
+    const value = full[1];
+    const r = parseInt(value.slice(0, 2), 16);
+    const g = parseInt(value.slice(2, 4), 16);
+    const b = parseInt(value.slice(4, 6), 16);
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  }
+  return "transparent";
+}
+
+function normalizeAngle(angle: number): number {
+  const fullTurn = Math.PI * 2;
+  const normalized = angle % fullTurn;
+  return normalized < 0 ? normalized + fullTurn : normalized;
+}
+
+function isGuideResizeMode(mode: string): mode is GuideResizeMode {
+  return mode === "resize-nw"
+    || mode === "resize-ne"
+    || mode === "resize-se"
+    || mode === "resize-sw";
+}
+
+function inverseRotatePoint(x: number, y: number, cx: number, cy: number, angle: number) {
+  const dx = x - cx;
+  const dy = y - cy;
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  return {
+    x: cx + dx * cos + dy * sin,
+    y: cy - dx * sin + dy * cos,
   };
+}
+
+function rotatePoint(x: number, y: number, cx: number, cy: number, angle: number) {
+  const dx = x - cx;
+  const dy = y - cy;
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  return {
+    x: cx + dx * cos - dy * sin,
+    y: cy + dx * sin + dy * cos,
+  };
+}
+
+function normalizedRectFromPoints(a: NormalizedPoint, b: NormalizedPoint): NormalizedRect {
+  const x = Math.min(a.x, b.x);
+  const y = Math.min(a.y, b.y);
+  return { x, y, w: Math.abs(a.x - b.x), h: Math.abs(a.y - b.y) };
+}
+
+function pointInRect(point: { x: number; y: number }, rect: NormalizedRect | null) {
+  return Boolean(rect && point.x >= rect.x && point.x <= rect.x + rect.w && point.y >= rect.y && point.y <= rect.y + rect.h);
+}
+
+function rectContainsRect(outer: NormalizedRect, inner: NormalizedRect | null) {
+  if (!inner) return false;
+  return inner.x >= outer.x
+    && inner.y >= outer.y
+    && inner.x + inner.w <= outer.x + outer.w
+    && inner.y + inner.h <= outer.y + outer.h;
+}
+
+function isEditableTarget(target: EventTarget | null) {
+  return target instanceof Element && Boolean(target.closest("button, input, textarea, select, a, [contenteditable='true'], .pdf-art-native-text-editor"));
+}
+
+function strokeBounds(stroke: StrokeAnnotation | null): NormalizedRect | null {
+  if (!stroke || stroke.points.length === 0) return null;
+  let minX = 1, minY = 1, maxX = 0, maxY = 0;
+  for (const point of stroke.points) {
+    minX = Math.min(minX, point.x);
+    minY = Math.min(minY, point.y);
+    maxX = Math.max(maxX, point.x);
+    maxY = Math.max(maxY, point.y);
+  }
+  const padding = Math.max(0.006, stroke.width / 1600);
+  return {
+    x: Math.max(0, minX - padding),
+    y: Math.max(0, minY - padding),
+    w: Math.min(1, maxX + padding) - Math.max(0, minX - padding),
+    h: Math.min(1, maxY + padding) - Math.max(0, minY - padding),
+  };
+}
+
+function textBounds(text: TextAnnotation | null, pageWidth: number, pageHeight: number): NormalizedRect | null {
+  if (!text || pageWidth <= 0 || pageHeight <= 0) return null;
+  const estimatedHeight = Math.max(text.fontSize * 1.6, 24) / pageHeight;
+  return {
+    x: text.x,
+    y: text.y,
+    w: text.width,
+    h: Math.min(1 - text.y, estimatedHeight),
+  };
+}
+
+function guideBoundsNormalized(guide: GuideAnnotation, pageWidth: number, pageHeight: number): NormalizedRect | null {
+  if (pageWidth <= 0 || pageHeight <= 0) return null;
+  const bounds = guideBounds(guide, pageWidth, pageHeight);
+  const cx = bounds.x + bounds.w / 2;
+  const cy = bounds.y + bounds.h / 2;
+  const corners = [
+    rotatePoint(bounds.x, bounds.y, cx, cy, guide.rotation),
+    rotatePoint(bounds.x + bounds.w, bounds.y, cx, cy, guide.rotation),
+    rotatePoint(bounds.x + bounds.w, bounds.y + bounds.h, cx, cy, guide.rotation),
+    rotatePoint(bounds.x, bounds.y + bounds.h, cx, cy, guide.rotation),
+  ];
+  const minX = Math.min(...corners.map((point) => point.x)) / pageWidth;
+  const minY = Math.min(...corners.map((point) => point.y)) / pageHeight;
+  const maxX = Math.max(...corners.map((point) => point.x)) / pageWidth;
+  const maxY = Math.max(...corners.map((point) => point.y)) / pageHeight;
+  return { x: Math.max(0, minX), y: Math.max(0, minY), w: Math.min(1, maxX) - Math.max(0, minX), h: Math.min(1, maxY) - Math.max(0, minY) };
+}
+
+function strokeHit(stroke: StrokeAnnotation, px: number, py: number, radiusPx: number, pageWidth: number, pageHeight: number) {
+  for (const point of stroke.points) {
+    if (Math.hypot(point.x * pageWidth - px, point.y * pageHeight - py) <= radiusPx) return true;
+  }
+  return false;
+}
+
+function drawSelectionBox(ctx: CanvasRenderingContext2D, box: SelectionBox, pageWidth: number, pageHeight: number) {
+  drawSelectionRect(ctx, normalizedRectFromPoints(box.start, box.current), pageWidth, pageHeight, true);
+}
+
+function drawSelectionRect(ctx: CanvasRenderingContext2D, rect: NormalizedRect, pageWidth: number, pageHeight: number, filled = false) {
+  ctx.save();
+  ctx.strokeStyle = "rgba(80, 160, 255, 0.95)";
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([5, 4]);
+  if (filled) {
+    ctx.fillStyle = "rgba(80, 160, 255, 0.12)";
+    ctx.fillRect(rect.x * pageWidth, rect.y * pageHeight, rect.w * pageWidth, rect.h * pageHeight);
+  }
+  ctx.strokeRect(rect.x * pageWidth, rect.y * pageHeight, rect.w * pageWidth, rect.h * pageHeight);
+  ctx.restore();
+}
+
+function createStroke(
+  tool: "pen" | "highlighter" | "eraser",
+  color: string,
+  width: number,
+  firstPoint: NormalizedPoint
+): StrokeAnnotation {
+  return {
+    id: `stroke-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    type: tool === "highlighter" ? "highlighter" : "pen",
+    points: [firstPoint],
+    color,
+    width,
+    opacity: tool === "highlighter" ? 0.35 : 1,
+  };
+}
+
+function drawStroke(ctx: CanvasRenderingContext2D, stroke: StrokeAnnotation, pageWidth: number, pageHeight: number) {
+  if (stroke.points.length === 0) return;
+  ctx.save();
+  ctx.globalAlpha = stroke.opacity;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = stroke.color;
+  ctx.lineWidth = stroke.width;
+  ctx.beginPath();
+  const first = stroke.points[0];
+  ctx.moveTo(first.x * pageWidth, first.y * pageHeight);
+  for (const point of stroke.points.slice(1)) {
+    ctx.lineTo(point.x * pageWidth, point.y * pageHeight);
+  }
+  if (stroke.points.length === 1) {
+    ctx.lineTo(first.x * pageWidth + 0.01, first.y * pageHeight + 0.01);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawStrokes(ctx: CanvasRenderingContext2D, strokes: StrokeAnnotation[], pageWidth: number, pageHeight: number) {
+  drawHighlighterStrokes(ctx, strokes.filter((stroke) => stroke.type === "highlighter"), pageWidth, pageHeight);
+  for (const stroke of strokes) {
+    if (stroke.type !== "highlighter") drawStroke(ctx, stroke, pageWidth, pageHeight);
+  }
+}
+
+function drawHighlighterStrokes(ctx: CanvasRenderingContext2D, strokes: StrokeAnnotation[], pageWidth: number, pageHeight: number) {
+  if (strokes.length === 0) return;
+  const groups = new Map<string, StrokeAnnotation[]>();
+  for (const stroke of strokes) {
+    const key = `${stroke.color}|${stroke.opacity}`;
+    const group = groups.get(key);
+    if (group) group.push(stroke);
+    else groups.set(key, [stroke]);
+  }
+
+  for (const group of groups.values()) {
+    const first = group[0];
+    const layer = document.createElement("canvas");
+    const layerCtx = layer.getContext("2d");
+    if (!layerCtx) continue;
+    const dpr = window.devicePixelRatio || 1;
+    layer.width = Math.max(1, Math.round(pageWidth * dpr));
+    layer.height = Math.max(1, Math.round(pageHeight * dpr));
+    layerCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    layerCtx.globalAlpha = 1;
+    for (const stroke of group) {
+      drawStroke(layerCtx, { ...stroke, opacity: 1 }, pageWidth, pageHeight);
+    }
+    ctx.save();
+    ctx.globalAlpha = first.opacity;
+    ctx.drawImage(layer, 0, 0, pageWidth, pageHeight);
+    ctx.restore();
+  }
 }

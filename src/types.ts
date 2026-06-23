@@ -1,41 +1,39 @@
 /// <reference types="obsidian" />
 
-import type { GuideState } from "./guides";
+import type { GuideAnnotation } from "./guides";
 
-// ── Data Types ──
-
-export interface GuideRect {
+// 坐标全部保存为 0-1 的页面比例，而不是像素。
+// 这样 PDF 缩放、不同屏幕 DPR、移动端宽度变化时，批注仍然贴在同一个页面位置。
+export interface NormalizedPoint {
   x: number;
   y: number;
-  w: number;
-  h: number;
+  pressure: number;
 }
 
-export interface PenStroke {
+export interface StrokeAnnotation {
+  id: string;
   type: "pen" | "highlighter";
-  points: { x: number; y: number; pressure: number }[];
+  points: NormalizedPoint[];
   color: string;
   width: number;
   opacity: number;
 }
 
 export interface TextAnnotation {
-  type: "text";
+  id: string;
   x: number;
   y: number;
-  text: string;
-  fontSize: number;
-  fontSizeRatio?: number;
-  color: string;
   width: number;
+  text: string;
+  color: string;
+  fontSize: number;
 }
-
-export type AnnotationItem = PenStroke | TextAnnotation;
 
 export interface PageAnnotations {
   page: number;
-  items: AnnotationItem[];
-  guides: GuideState[];
+  strokes: StrokeAnnotation[];
+  texts: TextAnnotation[];
+  guides: GuideAnnotation[];
 }
 
 export interface PDFAnnotationData {
@@ -44,17 +42,14 @@ export interface PDFAnnotationData {
   version: number;
 }
 
-// ── Settings ──
-
 export interface PDFArtSettings {
   defaultPenColor: string;
   defaultPenWidth: number;
   defaultHighlighterColor: string;
   defaultHighlighterWidth: number;
-  defaultFontSize: number;
   defaultTextColor: string;
-  annotationFolder: string;
-  /** When enabled, opening a PDF from the file explorer automatically opens it in the annotator */
+  defaultFontSize: number;
+  eraserWidth: number;
   autoOpenPDF: boolean;
 }
 
@@ -63,8 +58,8 @@ export const DEFAULT_SETTINGS: PDFArtSettings = {
   defaultPenWidth: 3,
   defaultHighlighterColor: "#ffff00",
   defaultHighlighterWidth: 12,
-  defaultFontSize: 16,
   defaultTextColor: "#ff4444",
-  annotationFolder: "",
+  defaultFontSize: 16,
+  eraserWidth: 16,
   autoOpenPDF: true,
 };

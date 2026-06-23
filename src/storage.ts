@@ -1,8 +1,10 @@
 import { normalizePath, Vault } from "obsidian";
-import { PDFAnnotationData, PageAnnotations, AnnotationItem } from "./types";
+import { PDFAnnotationData, PageAnnotations, StrokeAnnotation, TextAnnotation } from "./types";
+import { GuideAnnotation, GuideType } from "./guides";
 
 const ANNOTATION_ROOT = "PDF Art Annotations";
 const HASH_LENGTH = 12;
+const CURRENT_VERSION = 5;
 
 /**
  * Annotation storage — plugin-internal data persisted through vault.adapter.
@@ -69,14 +71,14 @@ export class AnnotationStore {
     const path = this.annotationPath(pdfPath);
     if (await this.vault.adapter.exists(path)) {
       const raw = await this.vault.adapter.read(path);
-      return this.parseAnnotationData(raw, path);
+      return this.parseAnnotationData(raw, path, pdfPath);
     }
 
     // Legacy migration: check old companion-file paths
     for (const legacyPath of this.legacyAnnotationPaths(pdfPath)) {
       if (await this.vault.adapter.exists(legacyPath)) {
         const raw = await this.vault.adapter.read(legacyPath);
-        const data = this.parseAnnotationData(raw, legacyPath);
+        const data = this.parseAnnotationData(raw, legacyPath, pdfPath);
         // Migrate to canonical path (adapter-only, no vault event)
         await this.ensureParentFolder(path);
         await this.vault.adapter.write(path, JSON.stringify(data, null, 2));
@@ -93,6 +95,7 @@ export class AnnotationStore {
   }
 
   async save(data: PDFAnnotationData): Promise<void> {
+    data.version = CURRENT_VERSION;
     const path = this.annotationPath(data.source);
     const json = JSON.stringify(data, null, 2);
     await this.ensureParentFolder(path);
@@ -114,30 +117,30 @@ export class AnnotationStore {
 
   async upsertPageAnnotations(pdfPath: string, annotations: PageAnnotations): Promise<void> {
     let data = await this.load(pdfPath);
-    if (!data) data = { source: pdfPath, pages: [], version: 1 };
+    if (!data) data = { source: pdfPath, pages: [], version: CURRENT_VERSION };
     const idx = data.pages.findIndex((p) => p.page === annotations.page);
     if (idx >= 0) data.pages[idx] = annotations;
     else data.pages.push(annotations);
     await this.save(data);
   }
 
-  async addItem(pdfPath: string, pageNum: number, item: AnnotationItem): Promise<void> {
+  async addStroke(pdfPath: string, pageNum: number, stroke: StrokeAnnotation): Promise<void> {
     let data = await this.load(pdfPath);
-    if (!data) data = { source: pdfPath, pages: [], version: 1 };
+    if (!data) data = { source: pdfPath, pages: [], version: CURRENT_VERSION };
     let page = data.pages.find((p) => p.page === pageNum);
     if (!page) {
-      page = { page: pageNum, items: [], guides: [] };
+      page = { page: pageNum, strokes: [], texts: [], guides: [] };
       data.pages.push(page);
     }
-    page.items.push(item);
+    page.strokes.push(stroke);
     await this.save(data);
   }
 
   // ── Private helpers ──
 
-  private parseAnnotationData(raw: string, path: string): PDFAnnotationData {
+  private parseAnnotationData(raw: string, path: string, fallbackSource: string): PDFAnnotationData {
     try {
-      return normalizeLegacyGuideTypes(JSON.parse(stripJsonBom(raw)) as PDFAnnotationData);
+      return normalizeAnnotationData(JSON.parse(stripJsonBom(raw)), fallbackSource);
     } catch (error) {
       throw new Error(`Invalid PDF Art annotation JSON at ${path}: ${error}`);
     }
@@ -178,26 +181,145 @@ function fnv1aHex(input: string): string {
   return hash.toString(16).padStart(16, "0");
 }
 
-function normalizeLegacyGuideTypes(data: PDFAnnotationData): PDFAnnotationData {
-  for (const page of data.pages ?? []) {
-    for (const guide of page.guides ?? []) {
-      if ((guide as { type?: string }).type === "rule-of-thirds") {
-        guide.type = "grid-9";
-      }
-      const legacyCorner = (guide as { spiralCorner?: string }).spiralCorner;
-      if (guide.type === "golden-spiral" && guide.rotation === undefined && legacyCorner) {
-        guide.rotation = legacySpiralCornerToRotation(legacyCorner);
-      }
-      delete (guide as { spiralCorner?: string }).spiralCorner;
-    }
+function normalizeAnnotationData(input: unknown, fallbackSource: string): PDFAnnotationData {
+  const raw = input as {
+    source?: unknown;
+    version?: unknown;
+    pages?: Array<{
+      page?: unknown;
+      strokes?: unknown;
+      texts?: unknown;
+      guides?: unknown;
+      items?: unknown;
+    }>;
+  };
+  const pages: PageAnnotations[] = [];
+  for (const page of raw.pages ?? []) {
+    const pageNumber = Number(page.page);
+    if (!Number.isInteger(pageNumber)) continue;
+    const strokes = normalizeStrokeList(page.strokes);
+    const texts = normalizeTextList(page.texts);
+    const guides = normalizeGuideList(page.guides, Number(raw.version) || 0);
+    // 兼容旧版数据：旧结构把画笔、荧光笔、文字都放在 items 里。
+    if (strokes.length === 0) strokes.push(...normalizeStrokeList(page.items));
+    if (texts.length === 0) texts.push(...normalizeTextList(page.items));
+    pages.push({ page: pageNumber, strokes, texts, guides });
   }
-  return data;
+  return {
+    source: typeof raw.source === "string" && raw.source ? raw.source : fallbackSource,
+    pages,
+    version: CURRENT_VERSION,
+  };
 }
 
-function legacySpiralCornerToRotation(corner: string): 0 | 1 | 2 | 3 {
-  if (corner === "bl") return 0;
-  if (corner === "br") return 1;
-  if (corner === "tr") return 2;
-  if (corner === "tl") return 3;
-  return 1;
+function normalizeStrokeList(value: unknown): StrokeAnnotation[] {
+  if (!Array.isArray(value)) return [];
+  const strokes: StrokeAnnotation[] = [];
+  for (const item of value as Array<Partial<StrokeAnnotation>>) {
+    if (item.type !== "pen" && item.type !== "highlighter") continue;
+    if (!Array.isArray(item.points) || item.points.length === 0) continue;
+    strokes.push({
+      id: typeof item.id === "string" ? item.id : makeStrokeId(),
+      type: item.type,
+      points: item.points.map((point) => ({
+        x: clamp01(Number(point.x)),
+        y: clamp01(Number(point.y)),
+        pressure: clamp01(Number(point.pressure) || 0.5),
+      })),
+      color: typeof item.color === "string" ? item.color : "#ff0000",
+      width: Number(item.width) || 3,
+      opacity: Number(item.opacity) || (item.type === "highlighter" ? 0.35 : 1),
+    });
+  }
+  return strokes;
+}
+
+function normalizeGuideList(value: unknown, dataVersion: number): GuideAnnotation[] {
+  if (!Array.isArray(value)) return [];
+  const guides: GuideAnnotation[] = [];
+  for (const item of value as Array<Partial<GuideAnnotation> & { _id?: unknown; rect?: { x?: unknown; y?: unknown; w?: unknown; h?: unknown }; visible?: unknown }>) {
+    const type = normalizeGuideType(item.type);
+    if (!type || item.visible === false) continue;
+    guides.push({
+      id: typeof item.id === "string" ? item.id : typeof item._id === "string" ? item._id : makeGuideId(),
+      type,
+      x: clamp01(Number(item.x ?? item.rect?.x ?? 0.1)),
+      y: clamp01(Number(item.y ?? item.rect?.y ?? 0.1)),
+      width: clampGuideSize(Number(item.width ?? item.rect?.w ?? 0.8)),
+      height: clampGuideSize(Number(item.height ?? item.rect?.h ?? 0.8)),
+      rotation: normalizeRotation(item.rotation, dataVersion),
+      mirrorX: Boolean(item.mirrorX),
+      mirrorY: Boolean(item.mirrorY),
+      color: typeof item.color === "string" ? item.color : "#ffffff",
+      strokeWidth: Number(item.strokeWidth) || 1,
+    });
+  }
+  return guides;
+}
+
+function normalizeGuideType(type: unknown): GuideType | null {
+  if (type === "grid-9" || type === "golden-ratio" || type === "golden-spiral") return type;
+  if (type === "grid-16" || type === "grid-12") return "grid-16";
+  return null;
+}
+
+function normalizeRotation(value: unknown, dataVersion: number): number {
+  const rotation = Number(value);
+  if (!Number.isFinite(rotation)) return 0;
+  if (dataVersion < 5 && (rotation === 1 || rotation === 2 || rotation === 3)) {
+    return normalizeAngle((rotation * Math.PI) / 2);
+  }
+  return normalizeAngle(rotation);
+}
+
+function normalizeTextList(value: unknown): TextAnnotation[] {
+  if (!Array.isArray(value)) return [];
+  const texts: TextAnnotation[] = [];
+  for (const item of value as Array<Partial<TextAnnotation> & { type?: unknown; fontSizeRatio?: unknown }>) {
+    if (item.type !== "text" && !("text" in item)) continue;
+    if (typeof item.text !== "string" || item.text.trim().length === 0) continue;
+    texts.push({
+      id: typeof item.id === "string" ? item.id : makeTextId(),
+      x: clamp01(Number(item.x)),
+      y: clamp01(Number(item.y)),
+      width: clampTextWidth(Number(item.width) || 0.28),
+      text: item.text,
+      color: typeof item.color === "string" ? item.color : "#ff4444",
+      fontSize: Number(item.fontSize) || 16,
+    });
+  }
+  return texts;
+}
+
+function makeStrokeId(): string {
+  return `stroke-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function makeTextId(): string {
+  return `text-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function makeGuideId(): string {
+  return `guide-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(1, Math.max(0, value));
+}
+
+function clampTextWidth(value: number): number {
+  if (!Number.isFinite(value)) return 0.28;
+  return Math.min(0.9, Math.max(0.08, value));
+}
+
+function clampGuideSize(value: number): number {
+  if (!Number.isFinite(value)) return 0.8;
+  return Math.min(1, Math.max(0.05, value));
+}
+
+function normalizeAngle(angle: number): number {
+  const fullTurn = Math.PI * 2;
+  const normalized = angle % fullTurn;
+  return normalized < 0 ? normalized + fullTurn : normalized;
 }
