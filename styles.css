@@ -84,6 +84,10 @@
   pointer-events: none;
 }
 
+.pdf-art-native-text-layer:not(.is-enabled) {
+  visibility: hidden;
+}
+
 .pdf-art-native-text-layer.is-enabled.is-text-tool {
   pointer-events: auto;
   cursor: text;
