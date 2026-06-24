@@ -1,20 +1,20 @@
 {
-  "name": "pdf-art-annotator",
-  "version": "1.0.0",
-  "description": "Obsidian plugin for drawing, text, selection editing, and composition guides on native PDF pages",
-  "main": "main.js",
-  "scripts": {
-    "dev": "node build.js",
-    "typecheck": "tsc -noEmit --skipLibCheck",
-    "build": "npm run typecheck && node build.js production",
-    "test": "vitest run"
-  },
-  "devDependencies": {
-    "@types/node": "^22.0.0",
-    "builtin-modules": "^5.2.0",
-    "esbuild": "^0.24.0",
-    "obsidian": "^1.7.2",
-    "typescript": "^5.6.0",
-    "vitest": "^4.1.9"
-  }
+	"name": "pdf-art-annotator",
+	"version": "1.0.1",
+	"description": "Obsidian plugin for drawing, text, selection editing, and composition guides on native PDF pages",
+	"main": "main.js",
+	"scripts": {
+		"dev": "node build.js",
+		"typecheck": "tsc -noEmit --skipLibCheck",
+		"build": "npm run typecheck && node build.js production",
+		"test": "vitest run"
+	},
+	"devDependencies": {
+		"@types/node": "^22.0.0",
+		"builtin-modules": "^5.2.0",
+		"esbuild": "^0.24.0",
+		"obsidian": "^1.7.2",
+		"typescript": "^5.6.0",
+		"vitest": "^4.1.9"
+	}
 }
