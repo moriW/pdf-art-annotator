@@ -22,11 +22,23 @@ export function registerPDFArtCommands(plugin: PDFArtAnnotatorPlugin) {
 
   plugin.addCommand({
     id: "toggle-pdf-art-annotator",
-    name: "切换当前 PDF 的 PDF Art 标注",
+    name: "切换当前 PDF 的 PDF Art 标注模式",
     checkCallback: (checking: boolean) => {
       if (!plugin.hasActivePDF()) return false;
       if (!checking) {
         void plugin.nativeOverlay.toggleActiveLeaf().then(() => plugin.refreshToolViews());
+      }
+      return true;
+    },
+  });
+
+  plugin.addCommand({
+    id: "toggle-pdf-art-rendering",
+    name: "切换当前 PDF 的 PDF Art 标注显示",
+    checkCallback: (checking: boolean) => {
+      if (!plugin.hasActivePDF()) return false;
+      if (!checking) {
+        void plugin.nativeOverlay.toggleActiveLeafRendering().then(() => plugin.refreshToolViews());
       }
       return true;
     },

@@ -62,12 +62,21 @@ export class PDFArtToolView extends ItemView {
       const header = contentEl.createDiv({ cls: "pdf-art-tool-view-header" });
       header.createDiv({ text: "PDF Art", cls: "pdf-art-tool-view-title" });
       header.createDiv({
-        text: state ? (state.getEnabled() ? "当前 PDF 已启用" : "当前 PDF 未启用") : "打开 PDF 后可用",
+        text: state
+          ? `${state.getRendered() ? "标注层已显示" : "标注层已隐藏"} · ${state.getEnabled() ? "标注模式开启" : "浏览模式"}`
+          : "打开 PDF 后可用",
         cls: "pdf-art-tool-view-status",
       });
 
-      const pdfGroup = this.createGroup(contentEl, "当前 PDF", "控制这个 PDF 页面上的标注层是否可交互");
-      const toggle = this.createButton(pdfGroup, state?.getEnabled() ? "关闭当前 PDF 标注" : "开启当前 PDF 标注", "power", async () => {
+      const pdfGroup = this.createGroup(contentEl, "当前 PDF", "分别控制标注层显示和页面输入模式");
+      const renderToggle = this.createButton(pdfGroup, state?.getRendered() ? "隐藏标注层" : "显示标注层", state?.getRendered() ? "eye-off" : "eye", async () => {
+        await this.withState((activeState) => activeState.toggleRendered());
+      });
+      renderToggle.addClass("pdf-art-tool-view-toggle");
+      renderToggle.toggleClass("is-active", Boolean(state?.getRendered()));
+      renderToggle.disabled = !state;
+
+      const toggle = this.createButton(pdfGroup, state?.getEnabled() ? "关闭标注模式" : "开启标注模式", "power", async () => {
         await this.withState((activeState) => activeState.toggleEnabled());
       });
       toggle.addClass("pdf-art-tool-view-toggle");

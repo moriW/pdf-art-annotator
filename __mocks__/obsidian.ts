@@ -25,6 +25,10 @@ export class TFolder extends TAbstractFile {
   isRoot(): boolean { return false; }
 }
 
+export class Notice {
+  constructor(public message: string) {}
+}
+
 export class Vault {
   adapter: any;
   constructor() {

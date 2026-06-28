@@ -71,6 +71,7 @@ export class NativePDFArtLeafState {
 	private observedPages = new Map<HTMLElement, number>();
 	private visiblePages = new Set<number>();
 	private overlays = new Map<number, NativePageOverlay>();
+	private rendered = true;
 	private enabled = false;
 	private tool: Tool = "pen";
 	private guideType: GuideType = "grid-9";
@@ -78,7 +79,6 @@ export class NativePDFArtLeafState {
 	private color = "#ff0000";
 	private width = 3;
 	private activeTextEditor: ActiveTextEditor | null = null;
-	private penInputPreferred = false;
 
 	constructor(
 		private readonly leaf: WorkspaceLeaf,
@@ -140,26 +140,35 @@ export class NativePDFArtLeafState {
 
 	toggleEnabled() {
 		this.enabled = !this.enabled;
+		if (this.enabled) this.rendered = true;
+		this.notifyStateChange();
+		this.refreshOverlayState();
+		this.renderAll();
+	}
+
+	toggleRendered() {
+		this.rendered = !this.rendered;
+		if (!this.rendered) {
+			this.enabled = false;
+			this.selectedItems = [];
+		}
+		this.notifyStateChange();
 		this.refreshOverlayState();
 		this.renderAll();
 	}
 
 	getEnabled() { return this.enabled; }
+	getRendered() { return this.rendered; }
 	getTool() { return this.tool; }
 	getColor() { return this.color; }
 	getWidth() { return this.width; }
 	getGuideType() { return this.guideType; }
 	getSelection() { return this.selectedItems; }
-	prefersPenInput() { return this.penInputPreferred; }
 	getSelectedGuide() {
 		const item = this.selectedItems.length === 1 && this.selectedItems[0].type === "guide" ? this.selectedItems[0] : null;
 		return item ? { page: item.page, id: item.id } : null;
 	}
 	hasActiveTextEditor() { return this.activeTextEditor !== null; }
-
-	preferPenInput() {
-		this.penInputPreferred = true;
-	}
 
 	setTool(tool: Tool) {
 		this.tool = tool;

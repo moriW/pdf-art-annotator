@@ -49,7 +49,6 @@ export class NativePageOverlay {
   private eraserChanged = false;
   private activeDrawPointerId: number | null = null;
   private activeDrawGestureGuardInstalled = false;
-  private touchPan: { pointerId: number; lastX: number; lastY: number; scrollElement: HTMLElement } | null = null;
 
   constructor(
     private readonly manager: NativePDFArtLeafState,
@@ -107,14 +106,16 @@ export class NativePageOverlay {
   }
 
   refreshState() {
+    this.canvas.toggleClass("is-rendered", this.manager.getRendered());
     this.canvas.toggleClass("is-enabled", this.manager.getEnabled());
     this.canvas.toggleClass("is-text-tool", this.manager.getTool() === "text");
+    this.textLayer.toggleClass("is-rendered", this.manager.getRendered());
     this.textLayer.toggleClass("is-enabled", this.manager.getEnabled());
     this.textLayer.toggleClass("is-text-tool", this.manager.getTool() === "text");
     this.canvas.dataset.tool = this.manager.getTool();
     this.cursor.dataset.tool = this.manager.getTool();
     this.updateCursorStyle();
-    if (!this.manager.getEnabled()) {
+    if (!this.manager.getEnabled() || !this.manager.getRendered()) {
       this.finishTextEditor?.();
       this.hideCursor();
     }
@@ -125,6 +126,10 @@ export class NativePageOverlay {
     const w = rect.width;
     const h = rect.height;
     this.ctx.clearRect(0, 0, w, h);
+    if (!this.manager.getRendered()) {
+      this.renderTextLayer(w, h);
+      return;
+    }
     const page = this.manager.getPage(this.pageNumber);
     const strokes = this.currentStroke ? [...page.strokes, this.currentStroke] : page.strokes;
     drawStrokes(this.ctx, strokes, w, h);
@@ -157,7 +162,6 @@ export class NativePageOverlay {
   }
 
   private readonly onPointerEnter = (event: PointerEvent) => {
-    this.preferPenInput(event);
     this.updateCursor(event);
   };
 
@@ -166,9 +170,7 @@ export class NativePageOverlay {
   };
 
   private readonly onTextLayerPointerDown = (event: PointerEvent) => {
-    if (!this.manager.getEnabled() || this.manager.getTool() !== "text") return;
-    if (!canDrawWithPointer(event, this.manager.prefersPenInput())) return;
-    this.preferPenInput(event);
+    if (!this.manager.getEnabled() || !this.manager.getRendered() || this.manager.getTool() !== "text") return;
     if (event.target !== this.textLayer) return;
     blockNativePointerEvent(event);
     if (this.finishTextEditor) {
@@ -182,13 +184,8 @@ export class NativePageOverlay {
   };
 
   private readonly onPointerDown = (event: PointerEvent) => {
-    if (!this.manager.getEnabled()) return;
+    if (!this.manager.getEnabled() || !this.manager.getRendered()) return;
     const tool = this.manager.getTool();
-    if (!canDrawWithPointer(event, this.manager.prefersPenInput())) {
-      this.beginTouchPan(event);
-      return;
-    }
-    this.preferPenInput(event);
     this.updateCursor(event);
     const point = this.point(event);
     if (tool === "text") {
@@ -240,12 +237,7 @@ export class NativePageOverlay {
   };
 
   private readonly onPointerMove = (event: PointerEvent) => {
-    if (this.touchPan) {
-      this.updateTouchPan(event);
-      return;
-    }
     if (this.activeDrawPointerId !== null && event.pointerId !== this.activeDrawPointerId) return;
-    this.preferPenInput(event);
     this.updateCursor(event);
     const point = this.point(event);
     if (this.manager.getTool() === "eraser" && this.activeDrawPointerId !== null) {
@@ -267,10 +259,6 @@ export class NativePageOverlay {
   };
 
   private readonly onPointerUp = (event: PointerEvent) => {
-    if (this.touchPan) {
-      this.endTouchPan(event);
-      return;
-    }
     if (this.activeDrawPointerId !== null && event.pointerId !== this.activeDrawPointerId) return;
     this.updateCursor(event);
     if (this.manager.getTool() === "eraser" && this.activeDrawPointerId !== null) {
@@ -304,54 +292,8 @@ export class NativePageOverlay {
     this.render();
   };
 
-  private beginTouchPan(event: PointerEvent) {
-    if (event.pointerType !== "touch" || this.touchPan || this.activeDrawPointerId !== null) return;
-    const scrollElement = this.findTouchScrollElement();
-    if (!scrollElement) return;
-    blockNativePointerEvent(event);
-    this.hideCursor();
-    this.touchPan = {
-      pointerId: event.pointerId,
-      lastX: event.clientX,
-      lastY: event.clientY,
-      scrollElement,
-    };
-    this.capturePointer(event.pointerId);
-  }
-
-  private updateTouchPan(event: PointerEvent) {
-    const pan = this.touchPan;
-    if (!pan || event.pointerId !== pan.pointerId) return;
-    blockNativePointerEvent(event);
-    const dx = event.clientX - pan.lastX;
-    const dy = event.clientY - pan.lastY;
-    pan.scrollElement.scrollLeft -= dx;
-    pan.scrollElement.scrollTop -= dy;
-    pan.lastX = event.clientX;
-    pan.lastY = event.clientY;
-  }
-
-  private endTouchPan(event: PointerEvent) {
-    const pan = this.touchPan;
-    if (!pan || event.pointerId !== pan.pointerId) return;
-    blockNativePointerEvent(event);
-    this.touchPan = null;
-    this.releasePointer(event.pointerId);
-  }
-
-  private findTouchScrollElement(): HTMLElement | null {
-    const viewer = this.wrapper.closest(".pdf-viewer-container");
-    if (viewer instanceof HTMLElement) return viewer;
-    let element = this.wrapper.parentElement;
-    while (element) {
-      if (element.scrollHeight > element.clientHeight || element.scrollWidth > element.clientWidth) return element;
-      element = element.parentElement;
-    }
-    return null;
-  }
-
   private readonly onKeyDown = (event: KeyboardEvent) => {
-    if (!this.manager.getEnabled() || this.manager.getTool() !== "select") return;
+    if (!this.manager.getEnabled() || !this.manager.getRendered() || this.manager.getTool() !== "select") return;
     if (event.key !== "Delete" && event.key !== "Backspace") return;
     if (event.metaKey || event.ctrlKey || event.altKey) return;
     if (isEditableTarget(event.target)) return;
@@ -364,7 +306,7 @@ export class NativePageOverlay {
   private beginDrawGestureGuard(event: PointerEvent) {
     this.activeDrawPointerId = event.pointerId;
     this.canvas.addClass("is-writing");
-    if (event.pointerType === "mouse" || this.activeDrawGestureGuardInstalled) return;
+    if (this.activeDrawGestureGuardInstalled) return;
     for (const eventName of ACTIVE_DRAW_GESTURE_EVENTS) {
       window.addEventListener(eventName, this.blockActiveDrawCompatibilityGesture, NON_PASSIVE_CAPTURE);
     }
@@ -373,10 +315,6 @@ export class NativePageOverlay {
 
   private capturePointer(pointerId: number) {
     try { this.wrapper.setPointerCapture(pointerId); } catch {}
-  }
-
-  private preferPenInput(event: PointerEvent) {
-    if (isPenLikePointer(event)) this.manager.preferPenInput();
   }
 
   private releasePointer(pointerId: number) {
@@ -401,6 +339,7 @@ export class NativePageOverlay {
     for (const child of Array.from(this.textLayer.children)) {
       if (child !== editor) child.remove();
     }
+    if (!this.manager.getRendered()) return;
     for (const text of this.manager.getPage(this.pageNumber).texts) {
       if (text.id === editingId) continue;
       const box = this.textLayer.createDiv({ cls: "pdf-art-native-text-box" });
@@ -413,7 +352,7 @@ export class NativePageOverlay {
       box.setText(text.text);
       box.toggleClass("is-selected", this.manager.isSelected(this.pageNumber, "text", text.id));
       box.addEventListener("pointerdown", (event) => this.onTextPointerDown(event, text));
-      if (this.manager.getEnabled() && this.manager.getTool() === "text") {
+      if (this.manager.getEnabled() && this.manager.getRendered() && this.manager.getTool() === "text") {
         const remove = box.createEl("button", { cls: "pdf-art-native-text-remove", text: "×" });
         remove.type = "button";
         remove.addEventListener("pointerdown", (event) => {
@@ -433,9 +372,7 @@ export class NativePageOverlay {
   }
 
   private onTextPointerDown(event: PointerEvent, text: TextAnnotation) {
-    if (!this.manager.getEnabled() || this.manager.getTool() !== "text") return;
-    if (!canDrawWithPointer(event, this.manager.prefersPenInput())) return;
-    this.preferPenInput(event);
+    if (!this.manager.getEnabled() || !this.manager.getRendered() || this.manager.getTool() !== "text") return;
     this.startTextDrag(event, text);
   }
 
@@ -822,7 +759,7 @@ export class NativePageOverlay {
   }
 
   private updateCursor(event: PointerEvent) {
-    if (!this.manager.getEnabled() || !canDrawWithPointer(event, this.manager.prefersPenInput())) {
+    if (!this.manager.getEnabled() || !this.manager.getRendered()) {
       this.hideCursor();
       return;
     }
@@ -866,20 +803,10 @@ export class NativePageOverlay {
   };
 }
 
-export function canDrawWithPointer(event: PointerEvent, penInputPreferred = false): boolean {
-  return event.pointerType === "pen"
-    || event.pointerType === "mouse"
-    || (event.pointerType === "touch" && !penInputPreferred);
-}
-
 function blockNativePointerEvent(event: PointerEvent) {
   event.preventDefault();
   event.stopPropagation();
   event.stopImmediatePropagation();
-}
-
-export function isPenLikePointer(event: PointerEvent): boolean {
-  return event.pointerType === "pen";
 }
 
 function colorToRgba(color: string, alpha: number): string {

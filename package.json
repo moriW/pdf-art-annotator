@@ -1,6 +1,6 @@
 {
 	"name": "pdf-art-annotator",
-	"version": "1.0.3",
+	"version": "1.0.4",
 	"description": "Obsidian plugin for drawing, text, selection editing, and composition guides on native PDF pages",
 	"main": "main.js",
 	"scripts": {

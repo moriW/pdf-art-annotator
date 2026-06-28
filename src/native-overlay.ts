@@ -105,6 +105,15 @@ export class NativePDFArtOverlayManager {
     }
   }
 
+  async toggleActiveLeafRendering() {
+    const state = await this.syncActiveLeaf();
+    if (state) {
+      state.toggleRendered();
+    } else {
+      new Notice("请先打开一个 PDF 文件");
+    }
+  }
+
   destroy() {
     for (const state of this.states.values()) state.destroy();
     this.states.clear();
