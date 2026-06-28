@@ -78,6 +78,7 @@ export class NativePDFArtLeafState {
 	private color = "#ff0000";
 	private width = 3;
 	private activeTextEditor: ActiveTextEditor | null = null;
+	private penInputPreferred = false;
 
 	constructor(
 		private readonly leaf: WorkspaceLeaf,
@@ -149,11 +150,16 @@ export class NativePDFArtLeafState {
 	getWidth() { return this.width; }
 	getGuideType() { return this.guideType; }
 	getSelection() { return this.selectedItems; }
+	prefersPenInput() { return this.penInputPreferred; }
 	getSelectedGuide() {
 		const item = this.selectedItems.length === 1 && this.selectedItems[0].type === "guide" ? this.selectedItems[0] : null;
 		return item ? { page: item.page, id: item.id } : null;
 	}
 	hasActiveTextEditor() { return this.activeTextEditor !== null; }
+
+	preferPenInput() {
+		this.penInputPreferred = true;
+	}
 
 	setTool(tool: Tool) {
 		this.tool = tool;
