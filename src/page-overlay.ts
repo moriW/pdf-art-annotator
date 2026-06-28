@@ -3,10 +3,6 @@ import { NormalizedPoint, StrokeAnnotation, TextAnnotation } from "./types";
 import { drawGuide, guideBounds, guideControlPoints, GuideAnnotation } from "./guides";
 
 export const ACTIVE_DRAW_GESTURE_EVENTS = [
-  "touchstart",
-  "touchmove",
-  "touchend",
-  "touchcancel",
   "gesturestart",
   "gesturechange",
   "gestureend",
@@ -68,12 +64,12 @@ export class NativePageOverlay {
     wrapper.appendChild(this.textLayer);
     wrapper.appendChild(this.cursor);
     this.textLayer.addEventListener("pointerdown", this.onTextLayerPointerDown);
-    this.canvas.addEventListener("pointerenter", this.onPointerEnter);
-    this.canvas.addEventListener("pointerleave", this.onPointerLeave);
-    this.canvas.addEventListener("pointerdown", this.onPointerDown);
-    this.canvas.addEventListener("pointermove", this.onPointerMove);
-    this.canvas.addEventListener("pointerup", this.onPointerUp);
-    this.canvas.addEventListener("pointercancel", this.onPointerUp);
+    this.wrapper.addEventListener("pointerenter", this.onPointerEnter);
+    this.wrapper.addEventListener("pointerleave", this.onPointerLeave);
+    this.wrapper.addEventListener("pointerdown", this.onPointerDown, true);
+    this.wrapper.addEventListener("pointermove", this.onPointerMove, true);
+    this.wrapper.addEventListener("pointerup", this.onPointerUp, true);
+    this.wrapper.addEventListener("pointercancel", this.onPointerUp, true);
     window.addEventListener("keydown", this.onKeyDown);
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(wrapper);
@@ -85,12 +81,12 @@ export class NativePageOverlay {
   destroy() {
     this.resizeObserver.disconnect();
     this.textLayer.removeEventListener("pointerdown", this.onTextLayerPointerDown);
-    this.canvas.removeEventListener("pointerenter", this.onPointerEnter);
-    this.canvas.removeEventListener("pointerleave", this.onPointerLeave);
-    this.canvas.removeEventListener("pointerdown", this.onPointerDown);
-    this.canvas.removeEventListener("pointermove", this.onPointerMove);
-    this.canvas.removeEventListener("pointerup", this.onPointerUp);
-    this.canvas.removeEventListener("pointercancel", this.onPointerUp);
+    this.wrapper.removeEventListener("pointerenter", this.onPointerEnter);
+    this.wrapper.removeEventListener("pointerleave", this.onPointerLeave);
+    this.wrapper.removeEventListener("pointerdown", this.onPointerDown, true);
+    this.wrapper.removeEventListener("pointermove", this.onPointerMove, true);
+    this.wrapper.removeEventListener("pointerup", this.onPointerUp, true);
+    this.wrapper.removeEventListener("pointercancel", this.onPointerUp, true);
     window.removeEventListener("keydown", this.onKeyDown);
     window.removeEventListener("pointermove", this.onTextPointerMove);
     window.removeEventListener("pointerup", this.onTextPointerUp);
@@ -169,6 +165,7 @@ export class NativePageOverlay {
 
   private readonly onTextLayerPointerDown = (event: PointerEvent) => {
     if (!this.manager.getEnabled() || this.manager.getTool() !== "text") return;
+    if (!canDrawWithPointer(event)) return;
     if (event.target !== this.textLayer) return;
     event.preventDefault();
     event.stopPropagation();
@@ -185,10 +182,20 @@ export class NativePageOverlay {
   private readonly onPointerDown = (event: PointerEvent) => {
     if (!this.manager.getEnabled()) return;
     const tool = this.manager.getTool();
-    if (tool === "text") return;
     if (!canDrawWithPointer(event)) return;
     this.updateCursor(event);
     const point = this.point(event);
+    if (tool === "text") {
+      if (isEditableTarget(event.target) || isTextAnnotationTarget(event.target)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (this.finishTextEditor) {
+        this.finishTextEditor();
+        return;
+      }
+      this.openTextEditor(point.x, point.y);
+      return;
+    }
     if (tool === "select") {
       event.preventDefault();
       event.stopPropagation();
@@ -199,7 +206,7 @@ export class NativePageOverlay {
       }
       this.selectionBox = { start: point, current: point };
       this.beginDrawGestureGuard(event);
-      this.canvas.setPointerCapture(event.pointerId);
+      this.capturePointer(event.pointerId);
       this.render();
       return;
     }
@@ -214,7 +221,7 @@ export class NativePageOverlay {
       event.stopPropagation();
       this.eraserChanged = this.manager.eraseAt(this.pageNumber, point.x, point.y, this.wrapper, { save: false });
       this.beginDrawGestureGuard(event);
-      this.canvas.setPointerCapture(event.pointerId);
+      this.capturePointer(event.pointerId);
       return;
     }
 
@@ -222,7 +229,7 @@ export class NativePageOverlay {
     event.stopPropagation();
     this.currentStroke = createStroke(tool, this.manager.getColor(), this.manager.getWidth(), point);
     this.beginDrawGestureGuard(event);
-    this.canvas.setPointerCapture(event.pointerId);
+    this.capturePointer(event.pointerId);
     this.render();
   };
 
@@ -257,7 +264,7 @@ export class NativePageOverlay {
     if (this.manager.getTool() === "eraser" && this.activeDrawPointerId !== null) {
       event.preventDefault();
       event.stopPropagation();
-      try { this.canvas.releasePointerCapture(event.pointerId); } catch {}
+      this.releasePointer(event.pointerId);
       if (this.eraserChanged) void this.manager.save();
       this.eraserChanged = false;
       this.endDrawGestureGuard(event.pointerId);
@@ -266,7 +273,7 @@ export class NativePageOverlay {
     if (this.manager.getTool() === "select" && this.activeDrawPointerId !== null) {
       event.preventDefault();
       event.stopPropagation();
-      try { this.canvas.releasePointerCapture(event.pointerId); } catch {}
+      this.releasePointer(event.pointerId);
       if (this.selectionBox) {
         const items = this.itemsInSelection(this.selectionBox);
         this.selectionBox = null;
@@ -280,7 +287,7 @@ export class NativePageOverlay {
     if (!this.currentStroke) return;
     event.preventDefault();
     event.stopPropagation();
-    try { this.canvas.releasePointerCapture(event.pointerId); } catch {}
+    this.releasePointer(event.pointerId);
     const stroke = this.currentStroke;
     this.currentStroke = null;
     this.endDrawGestureGuard(event.pointerId);
@@ -307,6 +314,14 @@ export class NativePageOverlay {
       window.addEventListener(eventName, this.blockActiveDrawCompatibilityGesture, NON_PASSIVE_CAPTURE);
     }
     this.activeDrawGestureGuardInstalled = true;
+  }
+
+  private capturePointer(pointerId: number) {
+    try { this.wrapper.setPointerCapture(pointerId); } catch {}
+  }
+
+  private releasePointer(pointerId: number) {
+    try { this.wrapper.releasePointerCapture(pointerId); } catch {}
   }
 
   private endDrawGestureGuard(pointerId?: number) {
@@ -360,6 +375,7 @@ export class NativePageOverlay {
 
   private onTextPointerDown(event: PointerEvent, text: TextAnnotation) {
     if (!this.manager.getEnabled() || this.manager.getTool() !== "text") return;
+    if (!canDrawWithPointer(event)) return;
     event.preventDefault();
     event.stopPropagation();
     const rect = this.wrapper.getBoundingClientRect();
@@ -372,12 +388,13 @@ export class NativePageOverlay {
       moved: false,
     };
     this.beginDrawGestureGuard(event);
-    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    this.capturePointer(event.pointerId);
     window.addEventListener("pointermove", this.onTextPointerMove);
     window.addEventListener("pointerup", this.onTextPointerUp);
   }
 
   private readonly onTextPointerMove = (event: PointerEvent) => {
+    if (this.activeDrawPointerId !== null && event.pointerId !== this.activeDrawPointerId) return;
     if (!this.textDrag) return;
     event.preventDefault();
     event.stopPropagation();
@@ -391,6 +408,7 @@ export class NativePageOverlay {
   };
 
   private readonly onTextPointerUp = (event: PointerEvent) => {
+    if (this.activeDrawPointerId !== null && event.pointerId !== this.activeDrawPointerId) return;
     if (!this.textDrag) return;
     event.preventDefault();
     event.stopPropagation();
@@ -398,6 +416,7 @@ export class NativePageOverlay {
     this.textDrag = null;
     window.removeEventListener("pointermove", this.onTextPointerMove);
     window.removeEventListener("pointerup", this.onTextPointerUp);
+    this.releasePointer(event.pointerId);
     this.endDrawGestureGuard(event.pointerId);
     const text = this.manager.getPage(this.pageNumber).texts.find((item) => item.id === drag.id);
     if (!text) return;
@@ -447,12 +466,13 @@ export class NativePageOverlay {
       };
     }
     this.beginDrawGestureGuard(event);
-    this.canvas.setPointerCapture(event.pointerId);
+    this.capturePointer(event.pointerId);
     window.addEventListener("pointermove", this.onGuidePointerMove);
     window.addEventListener("pointerup", this.onGuidePointerUp);
   }
 
   private readonly onGuidePointerMove = (event: PointerEvent) => {
+    if (this.activeDrawPointerId !== null && event.pointerId !== this.activeDrawPointerId) return;
     const drag = this.guideDrag;
     if (!drag) return;
     event.preventDefault();
@@ -478,13 +498,14 @@ export class NativePageOverlay {
   };
 
   private readonly onGuidePointerUp = (event: PointerEvent) => {
+    if (this.activeDrawPointerId !== null && event.pointerId !== this.activeDrawPointerId) return;
     if (!this.guideDrag) return;
     event.preventDefault();
     event.stopPropagation();
     this.guideDrag = null;
     window.removeEventListener("pointermove", this.onGuidePointerMove);
     window.removeEventListener("pointerup", this.onGuidePointerUp);
-    try { this.canvas.releasePointerCapture(event.pointerId); } catch {}
+    this.releasePointer(event.pointerId);
     this.endDrawGestureGuard(event.pointerId);
     void this.manager.save();
   };
@@ -853,6 +874,10 @@ function rectContainsRect(outer: NormalizedRect, inner: NormalizedRect | null) {
 
 function isEditableTarget(target: EventTarget | null) {
   return target instanceof Element && Boolean(target.closest("button, input, textarea, select, a, [contenteditable='true'], .pdf-art-native-text-editor"));
+}
+
+function isTextAnnotationTarget(target: EventTarget | null) {
+  return target instanceof Element && Boolean(target.closest(".pdf-art-native-text-box"));
 }
 
 function strokeBounds(stroke: StrokeAnnotation | null): NormalizedRect | null {
