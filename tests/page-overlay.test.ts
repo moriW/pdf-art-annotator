@@ -27,12 +27,12 @@ describe("canDrawWithPointer", () => {
     expect(canDrawWithPointer(touch, true)).toBe(false);
   });
 
-  it("accepts touch events that look like a stylus", () => {
+  it("does not infer pen input from touch-event shape", () => {
     const pressureTouch = pointer({ pointerType: "touch", width: 2, height: 2, pressure: 0.72 });
     const tiltedTouch = pointer({ pointerType: "touch", width: 20, height: 18, tiltX: 12 });
-    expect(canDrawWithPointer(pressureTouch, true)).toBe(true);
-    expect(canDrawWithPointer(tiltedTouch, true)).toBe(true);
-    expect(isPenLikePointer(pressureTouch)).toBe(true);
-    expect(isPenLikePointer(tiltedTouch)).toBe(true);
+    expect(canDrawWithPointer(pressureTouch, true)).toBe(false);
+    expect(canDrawWithPointer(tiltedTouch, true)).toBe(false);
+    expect(isPenLikePointer(pressureTouch)).toBe(false);
+    expect(isPenLikePointer(tiltedTouch)).toBe(false);
   });
 });

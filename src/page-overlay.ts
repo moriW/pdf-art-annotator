@@ -11,7 +11,6 @@ export const ACTIVE_DRAW_GESTURE_EVENTS = [
 export const NON_PASSIVE_CAPTURE: AddEventListenerOptions = { capture: true, passive: false };
 const GUIDE_CONTROL_HIT_RADIUS = 16;
 const GUIDE_MOVE_HIT_SLOP = 18;
-const TOUCH_STYLUS_MAX_CONTACT_SIZE = 6;
 type GuideResizeMode = "resize-nw" | "resize-ne" | "resize-se" | "resize-sw";
 type SelectionBox = { start: NormalizedPoint; current: NormalizedPoint };
 interface NormalizedRect {
@@ -50,6 +49,7 @@ export class NativePageOverlay {
   private eraserChanged = false;
   private activeDrawPointerId: number | null = null;
   private activeDrawGestureGuardInstalled = false;
+  private touchPan: { pointerId: number; lastX: number; lastY: number; scrollElement: HTMLElement } | null = null;
 
   constructor(
     private readonly manager: NativePDFArtLeafState,
@@ -184,7 +184,10 @@ export class NativePageOverlay {
   private readonly onPointerDown = (event: PointerEvent) => {
     if (!this.manager.getEnabled()) return;
     const tool = this.manager.getTool();
-    if (!canDrawWithPointer(event, this.manager.prefersPenInput())) return;
+    if (!canDrawWithPointer(event, this.manager.prefersPenInput())) {
+      this.beginTouchPan(event);
+      return;
+    }
     this.preferPenInput(event);
     this.updateCursor(event);
     const point = this.point(event);
@@ -237,6 +240,10 @@ export class NativePageOverlay {
   };
 
   private readonly onPointerMove = (event: PointerEvent) => {
+    if (this.touchPan) {
+      this.updateTouchPan(event);
+      return;
+    }
     if (this.activeDrawPointerId !== null && event.pointerId !== this.activeDrawPointerId) return;
     this.preferPenInput(event);
     this.updateCursor(event);
@@ -260,6 +267,10 @@ export class NativePageOverlay {
   };
 
   private readonly onPointerUp = (event: PointerEvent) => {
+    if (this.touchPan) {
+      this.endTouchPan(event);
+      return;
+    }
     if (this.activeDrawPointerId !== null && event.pointerId !== this.activeDrawPointerId) return;
     this.updateCursor(event);
     if (this.manager.getTool() === "eraser" && this.activeDrawPointerId !== null) {
@@ -292,6 +303,52 @@ export class NativePageOverlay {
     void this.manager.addStroke(this.pageNumber, stroke);
     this.render();
   };
+
+  private beginTouchPan(event: PointerEvent) {
+    if (event.pointerType !== "touch" || this.touchPan || this.activeDrawPointerId !== null) return;
+    const scrollElement = this.findTouchScrollElement();
+    if (!scrollElement) return;
+    blockNativePointerEvent(event);
+    this.hideCursor();
+    this.touchPan = {
+      pointerId: event.pointerId,
+      lastX: event.clientX,
+      lastY: event.clientY,
+      scrollElement,
+    };
+    this.capturePointer(event.pointerId);
+  }
+
+  private updateTouchPan(event: PointerEvent) {
+    const pan = this.touchPan;
+    if (!pan || event.pointerId !== pan.pointerId) return;
+    blockNativePointerEvent(event);
+    const dx = event.clientX - pan.lastX;
+    const dy = event.clientY - pan.lastY;
+    pan.scrollElement.scrollLeft -= dx;
+    pan.scrollElement.scrollTop -= dy;
+    pan.lastX = event.clientX;
+    pan.lastY = event.clientY;
+  }
+
+  private endTouchPan(event: PointerEvent) {
+    const pan = this.touchPan;
+    if (!pan || event.pointerId !== pan.pointerId) return;
+    blockNativePointerEvent(event);
+    this.touchPan = null;
+    this.releasePointer(event.pointerId);
+  }
+
+  private findTouchScrollElement(): HTMLElement | null {
+    const viewer = this.wrapper.closest(".pdf-viewer-container");
+    if (viewer instanceof HTMLElement) return viewer;
+    let element = this.wrapper.parentElement;
+    while (element) {
+      if (element.scrollHeight > element.clientHeight || element.scrollWidth > element.clientWidth) return element;
+      element = element.parentElement;
+    }
+    return null;
+  }
 
   private readonly onKeyDown = (event: KeyboardEvent) => {
     if (!this.manager.getEnabled() || this.manager.getTool() !== "select") return;
@@ -812,7 +869,6 @@ export class NativePageOverlay {
 export function canDrawWithPointer(event: PointerEvent, penInputPreferred = false): boolean {
   return event.pointerType === "pen"
     || event.pointerType === "mouse"
-    || isStylusLikeTouch(event)
     || (event.pointerType === "touch" && !penInputPreferred);
 }
 
@@ -823,16 +879,7 @@ function blockNativePointerEvent(event: PointerEvent) {
 }
 
 export function isPenLikePointer(event: PointerEvent): boolean {
-  return event.pointerType === "pen" || isStylusLikeTouch(event);
-}
-
-function isStylusLikeTouch(event: PointerEvent): boolean {
-  if (event.pointerType !== "touch") return false;
-  if (event.tiltX !== 0 || event.tiltY !== 0 || event.twist !== 0 || event.tangentialPressure !== 0) return true;
-  const contactSize = Math.max(event.width || 0, event.height || 0);
-  const hasPreciseContact = contactSize > 0 && contactSize <= TOUCH_STYLUS_MAX_CONTACT_SIZE;
-  const hasRealPressure = event.pressure > 0 && event.pressure !== 0.5;
-  return hasPreciseContact && hasRealPressure;
+  return event.pointerType === "pen";
 }
 
 function colorToRgba(color: string, alpha: number): string {
