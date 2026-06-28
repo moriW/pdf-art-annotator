@@ -1,7 +1,7 @@
 {
 	"id": "pdf-art-annotator",
 	"name": "PDF Art Annotator",
-	"version": "1.0.1",
+	"version": "1.0.2",
 	"minAppVersion": "0.15.0",
 	"description": "在 Obsidian 原生 PDF 查看器上添加画笔、荧光笔、文字、选择编辑和构图辅助线",
 	"author": "moriW",
