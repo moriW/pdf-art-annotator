@@ -60,8 +60,8 @@
 }
 
 .pdf-art-native-overlay.is-enabled {
-  pointer-events: auto;
-  touch-action: none;
+  pointer-events: none;
+  touch-action: pan-x pan-y pinch-zoom;
   cursor: none;
 }
 
@@ -74,7 +74,7 @@
 }
 
 .pdf-art-native-overlay.is-writing {
-  touch-action: none;
+  touch-action: pan-x pan-y pinch-zoom;
 }
 
 .pdf-art-native-text-layer {
@@ -89,12 +89,17 @@
 }
 
 .pdf-art-native-text-layer.is-enabled.is-text-tool {
-  pointer-events: auto;
-  touch-action: none;
+  pointer-events: none;
+  touch-action: pan-x pan-y pinch-zoom;
   cursor: text;
 }
 
-.pdf-art-native-text-layer.is-enabled.is-text-tool .pdf-art-native-text-box,
+.pdf-art-native-text-layer.is-enabled.is-text-tool .pdf-art-native-text-box {
+  pointer-events: none;
+  touch-action: pan-x pan-y pinch-zoom;
+}
+
+.pdf-art-native-text-layer.is-enabled.is-text-tool .pdf-art-native-text-remove,
 .pdf-art-native-text-layer.is-enabled.is-text-tool .pdf-art-native-text-editor {
   pointer-events: auto;
   touch-action: none;
