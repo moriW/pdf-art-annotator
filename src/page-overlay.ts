@@ -158,6 +158,7 @@ export class NativePageOverlay {
   }
 
   private readonly onPointerEnter = (event: PointerEvent) => {
+    this.preferPenInput(event);
     this.updateCursor(event);
   };
 
@@ -246,6 +247,7 @@ export class NativePageOverlay {
       return;
     }
     if (this.activeDrawPointerId !== null && event.pointerId !== this.activeDrawPointerId) return;
+    this.preferPenInput(event);
     this.updateCursor(event);
     const point = this.point(event);
     if (this.manager.getTool() === "eraser" && this.activeDrawPointerId !== null) {
